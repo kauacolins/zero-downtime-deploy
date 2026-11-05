@@ -1,0 +1,17 @@
+name: app-nginx
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    # A pasta inteira, para o Nginx enxergar o upstream.conf regravado pelo deploy.sh
+    volumes:
+      - ./nginx:/etc/nginx/conf.d:ro
+    networks: [web]
+
+networks:
+  web:
+    external: true

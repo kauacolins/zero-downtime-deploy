@@ -1,0 +1,12 @@
+# Migrações: docker compose run --rm --build migrate
+
+services:
+  migrate:
+    profiles: [migrate]
+    build:
+      context: .
+      target: migrate
+    image: app:migrate
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

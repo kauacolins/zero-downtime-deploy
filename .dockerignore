@@ -1,0 +1,22 @@
+.git
+.next
+.swc
+.vscode
+.claude
+.agents
+node_modules
+uploads
+logs
+coverage
+graphify-out
+*.tsbuildinfo
+*.md
+# Segredos entram só em tempo de execução, pelo env_file
+.env
+.env.*
+Dockerfile
+docker-compose.yaml
+docker-compose.*.yml
+deploy.sh
+.github
+nginx
