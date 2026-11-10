@@ -82,7 +82,9 @@ bash setup-host.sh --sistema meusistema --repo SEMIT-SUAS/meusistema \
   --env-hml NEXTAUTH_URL=http://<IP da VM>:3001
 ```
 
-Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga. As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
+Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga.
+
+O script guarda as respostas e onde parou em `~/.local/state/zero-downtime-deploy/`, sem o `GH_TOKEN` e sem os valores do `.env`. Ao rodar `bash setup-host.sh` de novo, por exemplo depois de cadastrar a deploy key ou preencher o `.env`, ele oferece **continuar**: mostra as pendências da última vez, reaproveita as respostas (só pergunta de novo o `GH_TOKEN` e se faz o deploy) e pula o que já foi feito. Também dá para **começar do zero**. As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
 
 No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode o mesmo comando com `--deploy` para o primeiro deploy, homologação primeiro. Depois disso, cada push publica sozinho.
 

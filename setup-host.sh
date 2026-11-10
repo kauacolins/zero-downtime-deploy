@@ -11,6 +11,7 @@ FORGE=github GIT_HOST=github.com FORGE_DEFINIDO=0
 SISTEMA="" PROD_NOME=production PROD_BRANCH="" HML_NOME=developer HML_BRANCH=""
 SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY="" SIM=0 INTERATIVO=auto
 REPOS=() PG_ACESSOS=() ENV_TODOS=() ENV_PROD=() ENV_HML=()
+SEGREDOS_PERGUNTADO=0 RETOMADO=0 ESTADO_ATIVO=0
 
 VERSAO=2.0.0
 
@@ -66,6 +67,10 @@ com listas de escolha para branches, bancos do PostgreSQL, segredos e valores do
 No fim mostra o comando equivalente, para repetir sem perguntas:
 
   bash setup-host.sh
+
+As respostas e onde a execução parou ficam em ~/.local/state/zero-downtime-deploy/ (sem o
+GH_TOKEN nem os valores do .env). Rodando de novo sem opções, o script oferece continuar com as
+mesmas respostas, mostrando as pendências da última vez, ou começar do zero.
 
 Acesso ao GitHub (cadastrar deploy keys e registrar runners; não vale para o GitLab):
   GH_TOKEN   token com escopo repo e admin nos repositórios. Na sua máquina: gh auth token.
@@ -155,7 +160,11 @@ erro_entrada() { printf '    %s%s %s%s\n' "$VERMELHO" "$I_ERRO" "$1" "$RESET" >/
 escolhido() { printf '    %s%s%s %s%s%s\n' "$VERDE" "$I_OK" "$RESET" "$FRACO" "$1" "$RESET" >/dev/tty; }
 
 ETAPA_ATUAL=""
-etapa() { ETAPA_ATUAL="$1"; printf '\n%s%s %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$1" "$RESET"; }
+etapa() {
+  ETAPA_ATUAL="$1"
+  if [ "$ESTADO_ATIVO" = 1 ]; then salvar_estado andamento; fi
+  printf '\n%s%s %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$1" "$RESET"
+}
 ok() { printf '    %s%s%s %s\n' "$VERDE" "$I_OK" "$RESET" "$1"; }
 aviso() { printf '    %s%s %s%s\n' "$AMARELO" "$I_AVISO" "$1" "$RESET"; PENDENCIAS+=("$1"); }
 falha() { printf '\n%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; exit 1; }
@@ -344,11 +353,88 @@ ler_repo() {
 sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sudo"
 
 # ---------------------------------------------------------------------------
+# Estado salvo: as respostas e onde a execução parou, para continuar sem responder tudo de novo.
+# Um arquivo por sistema, só do usuário (chmod 600). O GH_TOKEN e os valores digitados para o
+# .env nunca entram aqui (os do .env já ficam gravados no próprio .env).
+ESTADO_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zero-downtime-deploy"
+
+# salvar_estado andamento|interrompido|pendencias|concluido
+salvar_estado() {
+  local arq
+  [ -n "$SISTEMA" ] || return 0
+  mkdir -p "$ESTADO_DIR" && chmod 700 "$ESTADO_DIR"
+  arq="$ESTADO_DIR/setup-host.$SISTEMA.estado"
+  {
+    echo "# setup-host.sh: respostas e situação da última execução de $SISTEMA. Pode apagar."
+    declare -p FORGE GIT_HOST FORGE_DEFINIDO SISTEMA PROD_NOME PROD_BRANCH HML_NOME HML_BRANCH \
+      SEGREDOS SEGREDOS_PERGUNTADO PG_HML CLONAR DEPLOY REPOS PG_ACESSOS ENV_TODOS ENV_PROD ENV_HML
+    printf 'ESTADO_DATA=%q\nESTADO_ETAPA=%q\nESTADO_FIM=%q\n' "$(date '+%d/%m/%Y %H:%M')" "$ETAPA_ATUAL" "$1"
+    declare -p PENDENCIAS | sed 's/ PENDENCIAS=/ ESTADO_PENDENCIAS=/'
+  } >"$arq.tmp"
+  chmod 600 "$arq.tmp"
+  mv "$arq.tmp" "$arq"
+}
+
+# Ao sair, depois de confirmada a configuração: registra como terminou
+ao_sair() {
+  local codigo=$?
+  [ "$ESTADO_ATIVO" = 1 ] || return 0
+  if [ "$codigo" -ne 0 ]; then
+    salvar_estado interrompido
+  elif [ "${#PENDENCIAS[@]}" -gt 0 ]; then
+    salvar_estado pendencias
+  else
+    salvar_estado concluido
+  fi
+}
+
+# Uma linha de resumo de um arquivo de estado (lido num subshell: não mexe nas variáveis daqui)
+resumo_estado() {
+  (
+    # shellcheck disable=SC1090
+    source "$1"
+    case "$ESTADO_FIM" in
+      concluido) echo "$SISTEMA: concluído em $ESTADO_DATA" ;;
+      pendencias) echo "$SISTEMA: terminou com ${#ESTADO_PENDENCIAS[@]} pendência(s) em $ESTADO_DATA" ;;
+      *) echo "$SISTEMA: parou em \"$ESTADO_ETAPA\" em $ESTADO_DATA" ;;
+    esac
+  ) 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # Modo interativo: pergunta só o que não veio na linha de comando
 if [ "$INTERATIVO" = 1 ]; then
   { : </dev/tty; } 2>/dev/null || falha "o modo interativo precisa de um terminal"
   trap 'printf "\n\n  %s%s Cancelado: nada foi alterado.%s\n" "$AMARELO" "$I_AVISO" "$RESET" >/dev/tty; exit 130' INT
   banner "setup-host.sh $VERSAO" "prepara a VM para o deploy blue-green"
+
+  # Execução anterior: continuar com as mesmas respostas ou começar do zero
+  if [ -z "$SISTEMA" ] && [ "${#REPOS[@]}" -eq 0 ]; then
+    mapfile -t salvos < <(ls -t "$ESTADO_DIR"/setup-host.*.estado 2>/dev/null || true)
+    if [ "${#salvos[@]}" -gt 0 ]; then
+      opcoes=()
+      for f in "${salvos[@]}"; do
+        rotulo="$(resumo_estado "$f")"
+        [ -n "$rotulo" ] && opcoes+=("$f|continuar $rotulo")
+      done
+      if [ "${#opcoes[@]}" -gt 0 ]; then
+        echo >/dev/tty
+        opcoes+=("__novo|começar do zero (novas respostas)")
+        escolher retomar "Execuções anteriores (continuar repete as respostas; o que já foi feito é pulado)" 1 "${opcoes[@]}"
+        if [ "$retomar" != __novo ]; then
+          # shellcheck disable=SC1090
+          source "$retomar"
+          RETOMADO=1
+          # O deploy é decidido de novo: as pendências podem ter sido resolvidas
+          DEPLOY=""
+          if [ "${#ESTADO_PENDENCIAS[@]}" -gt 0 ]; then
+            printf '    %s%s Pendências da última vez:%s\n' "$AMARELO" "$I_AVISO" "$RESET" >/dev/tty
+            for p_ in "${ESTADO_PENDENCIAS[@]}"; do printf '      %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$p_" >/dev/tty; done
+          fi
+        fi
+      fi
+    fi
+  fi
   etapa "Configuração"
 
   if [ "$FORGE_DEFINIDO" = 0 ] && [ "${#REPOS[@]}" -eq 0 ]; then
@@ -405,13 +491,13 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   # PostgreSQL da máquina: banco de homologação e acesso da rede Docker aos bancos de produção
-  if [ -d /etc/postgresql ] && [ -z "$PG_HML" ]; then
+  if [ -d /etc/postgresql ] && [ -z "$PG_HML" ] && [ "$RETOMADO" = 0 ]; then
     hml_sugerido="$(tr '-' '_' <<<"$SISTEMA")_hml"
     escolher PG_HML "Banco de homologação no PostgreSQL da máquina" 1 \
       "$hml_sugerido|criar $hml_sugerido (banco e usuário novos, vazios)" \
       "|não criar (já existe ou fica em outro servidor)"
   fi
-  if [ -d /etc/postgresql ] && [ "${#PG_ACESSOS[@]}" -eq 0 ]; then
+  if [ -d /etc/postgresql ] && [ "${#PG_ACESSOS[@]}" -eq 0 ] && [ "$RETOMADO" = 0 ]; then
     bancos="$(sudo -u postgres psql -tAc "SELECT datname || '|' || pg_get_userbyid(datdba) FROM pg_database
       WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1" 2>/dev/null || true)"
     if [ -n "$bancos" ]; then
@@ -457,6 +543,9 @@ trap 'printf "\n\n  %s%s Interrompido em \"%s\". Rode o mesmo comando de novo pa
 PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
 [[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
 BASE="/opt/$SISTEMA"
+ESTADO_ATIVO=1
+trap ao_sair EXIT
+salvar_estado andamento
 if [ "$FORGE" = gitlab ]; then
   echo "GitLab ($GIT_HOST): deploy keys e runner ficam manuais; o script mostra o passo a passo."
 elif [ -z "${GH_TOKEN:-}" ]; then
@@ -802,7 +891,7 @@ for spec in "${REPOS[@]}"; do
     done
 
     # Interativo e sem --segredos: escolhe no .env.example, já marcando os que parecem segredos
-    if [ "$INTERATIVO" = 1 ] && [ -z "$SEGREDOS" ] && [ "${SEGREDOS_PERGUNTADO:-0}" = 0 ] && [ -n "$exemplo" ]; then
+    if [ "$INTERATIVO" = 1 ] && [ -z "$SEGREDOS" ] && [ "$SEGREDOS_PERGUNTADO" = 0 ] && [ -n "$exemplo" ]; then
       SEGREDOS_PERGUNTADO=1
       opcoes=() marcados="" i=1 escolhidos=()
       while IFS= read -r chave; do
@@ -1015,5 +1104,8 @@ else
   for p in "${PENDENCIAS[@]}"; do printf '      %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$p"; done
 fi
 [ "${DOCKER[0]}" = sudo ] && printf '    %s%s%s Saia e entre de novo na sessão para usar docker sem sudo.\n' "$CIANO" "$I_INFO" "$RESET"
+if [ "${#PENDENCIAS[@]}" -gt 0 ]; then
+  printf '    %s%s%s Resolvidas as pendências, rode bash setup-host.sh e escolha continuar: as respostas são reaproveitadas\n' "$CIANO" "$I_INFO" "$RESET"
+fi
 printf '\n%s%s Concluído em %dmin%02ds%s\n' "$VERDE$NEGRITO" "$I_OK" $((SECONDS / 60)) $((SECONDS % 60)) "$RESET"
 exit 0
