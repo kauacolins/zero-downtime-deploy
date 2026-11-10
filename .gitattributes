@@ -1,0 +1,6 @@
+# Scripts e configurações rodam no Linux: CRLF quebraria o bash ("$'\r': command not found")
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.conf text eol=lf
+*.inc text eol=lf

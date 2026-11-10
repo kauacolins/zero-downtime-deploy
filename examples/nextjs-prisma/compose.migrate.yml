@@ -1,0 +1,12 @@
+# Migrações do Prisma. O deploy.sh roda este serviço antes de subir a cor nova:
+#   docker compose -p <projeto>-migrate -f compose.migrate.yml run --rm --build migrate
+# Sem "image": o nome vem do projeto (-p), então cada sistema e ambiente tem a sua.
+
+services:
+  migrate:
+    build:
+      context: .
+      target: migrate
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

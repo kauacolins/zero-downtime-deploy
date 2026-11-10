@@ -1,0 +1,22 @@
+# Nginx único para os dois ambientes: o deploy.sh o sobe a partir da pasta de produção.
+# Gerado pelo zero-downtime-deploy (modelos/compose.nginx.yml).
+name: {{SISTEMA}}-nginx
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # Homologação
+      - "{{PORTA_HML}}:{{PORTA_HML}}"
+    # Pastas inteiras, para o Nginx enxergar os arquivos regravados pelo Git e pelo deploy.sh
+    volumes:
+      - /opt/{{SISTEMA}}/{{PROD_NOME}}/nginx:/etc/nginx/conf.d:ro
+      - /opt/{{SISTEMA}}/nginx:/etc/nginx/active:ro
+    networks: [web]
+
+networks:
+  web:
+    external: true

@@ -1,0 +1,40 @@
+# Push na {{HML_BRANCH}} publica em homologação; push na {{PROD_BRANCH}}, em produção.
+# Gerado pelo zero-downtime-deploy (modelos/github-deploy.yml). Inclua os testes do sistema no job test.
+name: Deploy
+
+on:
+  push:
+    branches: [{{PROD_BRANCH}}, {{HML_BRANCH}}]
+  pull_request:
+    branches: [{{PROD_BRANCH}}, {{HML_BRANCH}}]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Testes do sistema aqui (ex.: npm ci && npm test, ./mvnw verify)
+      - run: echo "sem testes configurados"
+
+  deploy:
+    needs: test
+    # Pull request não executa nada na VM
+    if: github.event_name == 'push'
+    # Runner instalado na VM pelo setup-host.sh, com a label do sistema
+    runs-on: [self-hosted, {{SISTEMA}}]
+    timeout-minutes: 30
+    # Um grupo por branch: um push na {{HML_BRANCH}} não cancela um deploy da {{PROD_BRANCH}} na fila
+    concurrency: deploy-${{ github.ref_name }}
+    env:
+      ENV_NAME: ${{ github.ref_name == '{{PROD_BRANCH}}' && '{{PROD_NOME}}' || '{{HML_NOME}}' }}
+    steps:
+      - name: Deploy
+        working-directory: /opt/{{SISTEMA}}/${{ env.ENV_NAME }}
+        run: |
+          git fetch origin
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+          bash deploy.sh "$ENV_NAME"

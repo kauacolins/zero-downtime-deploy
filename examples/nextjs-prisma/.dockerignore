@@ -14,9 +14,10 @@ graphify-out
 # Segredos entram só em tempo de execução, pelo env_file
 .env
 .env.*
+# Arquivos de deploy: mudar um deles não deve invalidar o cache da imagem
 Dockerfile
-docker-compose.yaml
-docker-compose.*.yml
+compose.*.yml
 deploy.sh
 .github
+.gitlab-ci.yml
 nginx

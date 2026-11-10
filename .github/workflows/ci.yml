@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        # O modelo deploy.sh tem marcadores {{...}}: ele é conferido depois de gerado, no job modelos
+        run: shellcheck -S warning setup-host.sh scaffold.sh
+
+  modelos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gera os arquivos de um sistema de exemplo
+        run: |
+          docker network create web 2>/dev/null || true
+          for ci in github gitlab; do
+            for stack in "" nextjs-prisma; do
+              echo "::group::ci=$ci stack=${stack:-nenhuma}"
+              dest="$(mktemp -d)"
+              bash scaffold.sh --sistema exemplo --dominio-prod exemplo.gov.br \
+                --dominio-hml hml-exemplo.gov.br --ci "$ci" ${stack:+--stack "$stack"} "$dest"
+              shellcheck -S warning "$dest/deploy.sh"
+              if grep -rnE '\{\{[A-Z_]+\}\}' "$dest"; then echo "marcador sem valor"; exit 1; fi
+              (cd "$dest" && touch .env && for f in compose.*.yml; do docker compose -f "$f" config -q; done)
+              # Rodar de novo não pode sobrescrever nada
+              bash scaffold.sh --sistema outro --dominio-prod a --dominio-hml b --ci "$ci" \
+                ${stack:+--stack "$stack"} "$dest" | grep -q '^  + ' && { echo "sobrescreveu ou duplicou"; exit 1; }
+              echo "::endgroup::"
+            done
+          done
+      - name: Valida a configuração do Nginx
+        run: |
+          dest="$(mktemp -d)"
+          bash scaffold.sh --sistema exemplo --dominio-prod exemplo.gov.br \
+            --dominio-hml hml-exemplo.gov.br "$dest"
+          mkdir -p "$dest/active"
+          # O resolver do Docker só existe em rede própria
+          docker network create teste-nginx
+          docker run --rm --network teste-nginx \
+            -v "$dest/nginx:/etc/nginx/conf.d:ro" -v "$dest/active:/etc/nginx/active:ro" \
+            nginx:1.27-alpine nginx -t
+
+  ajuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ajuda funciona com o script baixado pelo curl (sem arquivo)
+        run: |
+          bash -s -- --help < setup-host.sh | grep -q -- '--sistema'
+          bash setup-host.sh --versao
+          bash scaffold.sh --versao
