@@ -47,7 +47,7 @@ bash zero-downtime-deploy/scaffold.sh --sistema meusistema \
   --stack nextjs-prisma  ../meusistema
 ```
 
-Sem as opções, num terminal, ele pergunta o que faltar (`bash zero-downtime-deploy/scaffold.sh`): lê o repositório para sugerir nome, branches, stack e CI, oferece listas de escolha e, se já houver um CI antigo, pergunta se deve mantê-lo ou substituí-lo (o antigo fica em `.bak`). No fim mostra o comando equivalente, para repetir sem perguntas.
+Sem as opções, num terminal, ele pergunta o que faltar (`bash zero-downtime-deploy/scaffold.sh`): lista as pastas com `.git` perto de você (pasta atual, a de cima, a vizinha a este projeto e a home) para escolher pelo número, lê o repositório para sugerir nome, branches, stack e CI, oferece listas de escolha e, se já houver um CI antigo, pergunta se deve mantê-lo ou substituí-lo (o antigo fica em `.bak`). No fim mostra o comando equivalente, para repetir sem perguntas.
 
 O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
 
