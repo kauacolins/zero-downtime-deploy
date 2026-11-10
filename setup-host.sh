@@ -163,9 +163,11 @@ falha() { printf '\n%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; 
 confirmar() {
   [ "$SIM" = 1 ] && return 0
   local resp=""
-  # 2> antes de </dev/tty: sem terminal (ssh sem -t, CI), a falha ao abrir não aparece
-  read -r -p "  $(rotulo_pergunta "$1" s/N)" resp 2>/dev/null </dev/tty || return 1
-  [[ "$resp" =~ ^[sS]$ ]]
+  # Sem terminal (ssh sem -t, CI), a resposta é não. Não dá para silenciar o stderr do read:
+  # o read -p escreve a pergunta no stderr, e ela sumia da tela (parecia travado)
+  { : </dev/tty; } 2>/dev/null || return 1
+  read -r -p "  $(rotulo_pergunta "$1" s/N)" resp </dev/tty || return 1
+  [[ "$resp" =~ ^([sS]|[sS][iI][mM])$ ]]
 }
 
 # ---------------------------------------------------------------------------
