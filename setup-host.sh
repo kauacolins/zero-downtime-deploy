@@ -123,16 +123,48 @@ USUARIO="$(id -un)"
 GRUPO="$(id -gn)"
 PENDENCIAS=()
 
-etapa() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
-ok() { printf '    \033[32m✓\033[0m %s\n' "$1"; }
-aviso() { printf '    \033[33m!\033[0m %s\n' "$1"; PENDENCIAS+=("$1"); }
-falha() { printf '\n\033[31mErro: %s\033[0m\n' "$1" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Visual: cores só num terminal (NO_COLOR desliga); ícones Unicode só com locale UTF-8
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  NEGRITO=$'\033[1m' FRACO=$'\033[2m' VERMELHO=$'\033[31m' VERDE=$'\033[32m'
+  AMARELO=$'\033[33m' AZUL=$'\033[34m' CIANO=$'\033[36m' RESET=$'\033[0m'
+else
+  NEGRITO="" FRACO="" VERMELHO="" VERDE="" AMARELO="" AZUL="" CIANO="" RESET=""
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}} $(locale charmap 2>/dev/null || true)" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+    I_OK="✔" I_AVISO="⚠" I_ERRO="✖" I_SETA="❯" I_ETAPA="▸" I_LOGO="◆" I_INFO="ℹ"
+    I_MARCADO="◉" I_VAZIO="○" I_ITEM="•" I_NOVO="+" I_MANTIDO="=" I_MOVIDO="↪" I_GIRO="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" ;;
+  *)
+    I_OK="v" I_AVISO="!" I_ERRO="x" I_SETA=">" I_ETAPA="==>" I_LOGO="*" I_INFO="i"
+    I_MARCADO="x" I_VAZIO=" " I_ITEM="-" I_NOVO="+" I_MANTIDO="=" I_MOVIDO="~" I_GIRO='|/-\' ;;
+esac
+
+# Cabeçalho do modo interativo
+banner() {
+  printf '\n  %s%s %s%s  %s%s%s\n' "$NEGRITO$AZUL" "$I_LOGO" "$1" "$RESET" "$FRACO" "$2" "$RESET" >/dev/tty
+  printf '  %sEnter aceita a sugestão entre colchetes · Ctrl+C cancela%s\n' "$FRACO" "$RESET" >/dev/tty
+}
+
+# "? Pergunta [padrão] ❯ "
+rotulo_pergunta() {
+  printf '  %s?%s %s%s%s%s %s%s%s ' "$CIANO" "$RESET" "$NEGRITO" "$1" "$RESET" \
+    "${2:+ $FRACO[$2]$RESET}" "$CIANO" "$I_SETA" "$RESET"
+}
+erro_entrada() { printf '    %s%s %s%s\n' "$VERMELHO" "$I_ERRO" "$1" "$RESET" >/dev/tty; }
+escolhido() { printf '    %s%s%s %s%s%s\n' "$VERDE" "$I_OK" "$RESET" "$FRACO" "$1" "$RESET" >/dev/tty; }
+
+ETAPA_ATUAL=""
+etapa() { ETAPA_ATUAL="$1"; printf '\n%s%s %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$1" "$RESET"; }
+ok() { printf '    %s%s%s %s\n' "$VERDE" "$I_OK" "$RESET" "$1"; }
+aviso() { printf '    %s%s %s%s\n' "$AMARELO" "$I_AVISO" "$1" "$RESET"; PENDENCIAS+=("$1"); }
+falha() { printf '\n%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; exit 1; }
 
 confirmar() {
   [ "$SIM" = 1 ] && return 0
   local resp=""
   # 2> antes de </dev/tty: sem terminal (ssh sem -t, CI), a falha ao abrir não aparece
-  read -r -p "    $1 [s/N] " resp 2>/dev/null </dev/tty || return 1
+  read -r -p "  $(rotulo_pergunta "$1" s/N)" resp 2>/dev/null </dev/tty || return 1
   [[ "$resp" =~ ^[sS]$ ]]
 }
 
@@ -140,34 +172,32 @@ confirmar() {
 # Perguntas do modo interativo. Leem de /dev/tty: funcionam também com curl ... | bash.
 # As opções de escolher/escolher_varios são "valor|texto mostrado".
 
-# sim_nao "Pergunta" s|n: pergunta de configuração, que o --sim não responde sozinho
-sim_nao() {
-  local resp=""
-  read -r -p "  $1 [$([ "$2" = s ] && echo S/n || echo s/N)] " resp </dev/tty || falha "sem resposta para: $1"
-  resp="${resp:-$2}"
-  [[ "$resp" =~ ^[sS]$ ]]
-}
-
 # perguntar VAR "Pergunta" [padrão] [regex]: sem regex, a resposta é obrigatória
 perguntar() {
   local -n __resp_var="$1"
   local texto="$2" padrao="${3:-}" regex="${4:-.}" resp=""
   while true; do
-    read -r -p "  $texto${padrao:+ [$padrao]}: " resp </dev/tty || falha "sem resposta para: $texto"
+    read -r -p "$(rotulo_pergunta "$texto" "$padrao")" resp </dev/tty || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     [[ "$resp" =~ $regex ]] && break
-    echo "    Valor inválido." >/dev/tty
+    erro_entrada "Valor inválido."
   done
   __resp_var="$resp"
 }
 
-# perguntar_segredo VAR "Pergunta": não mostra o que é digitado; Enter deixa vazio
-perguntar_segredo() {
-  local -n __seg_var="$1"
+# sim_nao "Pergunta" s|n: pergunta de configuração, que o --sim não responde sozinho
+sim_nao() {
   local resp=""
-  read -rs -p "  $2: " resp </dev/tty || true
-  echo >/dev/tty
-  __seg_var="$resp"
+  while true; do
+    read -r -p "$(rotulo_pergunta "$1" "$([ "$2" = s ] && echo S/n || echo s/N)")" resp </dev/tty \
+      || falha "sem resposta para: $1"
+    resp="${resp:-$2}"
+    case "$resp" in
+      [sS]|[sS][iI][mM]) return 0 ;;
+      [nN]|[nN][aAãÃ][oO]) return 1 ;;
+    esac
+    erro_entrada "Responda s ou n."
+  done
 }
 
 # escolher VAR "Pergunta" N_PADRÃO "valor|texto" ...: uma opção, pelo número
@@ -175,54 +205,82 @@ escolher() {
   local -n __esc_var="$1"
   local texto="$2" padrao="$3" i=1 op resp
   shift 3
-  echo "  $texto" >/dev/tty
+  printf '  %s?%s %s%s%s\n' "$CIANO" "$RESET" "$NEGRITO" "$texto" "$RESET" >/dev/tty
   for op in "$@"; do
-    printf '    %d) %s\n' "$i" "${op#*|}" >/dev/tty
+    if [ "$i" = "$padrao" ]; then
+      printf '  %s%s %2d)%s %s\n' "$CIANO" "$I_SETA" "$i" "$RESET" "${op#*|}" >/dev/tty
+    else
+      printf '    %s%2d)%s %s\n' "$FRACO" "$i" "$RESET" "${op#*|}" >/dev/tty
+    fi
     i=$((i + 1))
   done
   while true; do
-    read -r -p "  Escolha [$padrao]: " resp </dev/tty || falha "sem resposta para: $texto"
+    read -r -p "    Escolha $FRACO[$padrao]$RESET $CIANO$I_SETA$RESET " resp </dev/tty || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     if [[ "$resp" =~ ^[0-9]+$ ]] && [ "$resp" -ge 1 ] && [ "$resp" -le $# ]; then
       op="${!resp}"
       __esc_var="${op%%|*}"
+      [[ "$__esc_var" == __* ]] || escolhido "${op#*|}"  # "outra": a próxima pergunta já mostra
       return
     fi
-    echo "    Digite um número de 1 a $#." >/dev/tty
+    erro_entrada "Digite um número de 1 a $#."
   done
+}
+
+# perguntar_segredo VAR "Pergunta": não mostra o que é digitado; Enter deixa vazio
+perguntar_segredo() {
+  local -n __seg_var="$1"
+  local resp=""
+  read -rs -p "$(rotulo_pergunta "$2" "oculto")" resp </dev/tty || true
+  echo >/dev/tty
+  if [ -n "$resp" ]; then
+    escolhido "recebido (${#resp} caracteres, não exibido)"
+  else
+    printf '    %s%s vazio%s\n' "$FRACO" "$I_ITEM" "$RESET" >/dev/tty
+  fi
+  __seg_var="$resp"
 }
 
 # escolher_varios ARRAY "Pergunta" "NÚMEROS MARCADOS" "valor|texto" ...: várias opções
 escolher_varios() {
   local -n __varios_var="$1"
-  local texto="$2" padrao="$3" i=1 op resp n valido marca
+  local texto="$2" padrao="$3" i=1 op resp n valido nomes
   shift 3
-  echo "  $texto" >/dev/tty
+  printf '  %s?%s %s%s%s\n' "$CIANO" "$RESET" "$NEGRITO" "$texto" "$RESET" >/dev/tty
   for op in "$@"; do
-    marca=" "
-    [[ " $padrao " == *" $i "* ]] && marca=x
-    printf '    [%s] %d) %s\n' "$marca" "$i" "${op#*|}" >/dev/tty
+    if [[ " $padrao " == *" $i "* ]]; then
+      printf '    %s%s%s %s%2d)%s %s\n' "$VERDE" "$I_MARCADO" "$RESET" "$FRACO" "$i" "$RESET" "${op#*|}" >/dev/tty
+    else
+      printf '    %s%s %2d)%s %s\n' "$FRACO" "$I_VAZIO" "$i" "$RESET" "${op#*|}" >/dev/tty
+    fi
     i=$((i + 1))
   done
   while true; do
-    read -r -p "  Números separados por espaço (Enter: os marcados; 0: nenhum): " resp </dev/tty \
+    read -r -p "    Números separados por espaço $FRACO(Enter: os marcados $I_MARCADO · 0: nenhum)$RESET $CIANO$I_SETA$RESET " resp </dev/tty \
       || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     __varios_var=()
+    nomes=""
     valido=1
     for n in ${resp//,/ }; do
       if [ "$n" = 0 ]; then
         __varios_var=()
+        nomes=""
         break
       elif [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le $# ]; then
         op="${!n}"
         __varios_var+=("${op%%|*}")
+        nomes+="${nomes:+, }${op#*|}"
       else
         valido=0
       fi
     done
-    [ "$valido" = 1 ] && return
-    echo "    Use números de 1 a $#." >/dev/tty
+    if [ "$valido" = 1 ]; then
+      escolhido "${nomes:-nenhum}"
+      return
+    fi
+    erro_entrada "Use números de 1 a $#."
+
   done
 }
 
@@ -287,7 +345,9 @@ sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sud
 # Modo interativo: pergunta só o que não veio na linha de comando
 if [ "$INTERATIVO" = 1 ]; then
   { : </dev/tty; } 2>/dev/null || falha "o modo interativo precisa de um terminal"
-  printf '\n\033[1;34m==> Configuração\033[0m (Enter aceita o valor entre colchetes)\n'
+  trap 'printf "\n\n  %s%s Cancelado: nada foi alterado.%s\n" "$AMARELO" "$I_AVISO" "$RESET" >/dev/tty; exit 130' INT
+  banner "setup-host.sh $VERSAO" "prepara a VM para o deploy blue-green"
+  etapa "Configuração"
 
   if [ "$FORGE_DEFINIDO" = 0 ] && [ "${#REPOS[@]}" -eq 0 ]; then
     escolher FORGE "Onde estão os repositórios?" 1 \
@@ -386,9 +446,11 @@ if [ "$INTERATIVO" = 1 ]; then
   [ -n "$PG_HML" ] && cmd+=" --pg-hml $PG_HML"
   for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-acesso $a"; done
   [ "$DEPLOY" = 1 ] && cmd+=" --deploy"
-  printf '\n  Comando equivalente:\n    %s\n\n' "$cmd"
-  sim_nao "Continuar?" s || { echo "Nada foi alterado."; exit 0; }
+  printf '\n  %s%s Para repetir sem perguntas:%s\n    %s%s%s\n\n' "$FRACO" "$I_INFO" "$RESET" "$CIANO" "$cmd" "$RESET"
+  sim_nao "Continuar?" s || { printf '  %s%s Nada foi alterado.%s\n' "$AMARELO" "$I_AVISO" "$RESET"; exit 0; }
 fi
+# Interrompido no meio: cada etapa confere o que já está feito, então basta rodar de novo
+trap 'printf "\n\n  %s%s Interrompido em \"%s\". Rode o mesmo comando de novo para continuar.%s\n" "$AMARELO" "$I_AVISO" "$ETAPA_ATUAL" "$RESET" >&2; exit 130' INT
 
 PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
 [[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
@@ -936,14 +998,15 @@ fi
 etapa "Resumo"
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
-  echo "    $SLUG -> $RAIZ/{$PROD_NOME,$HML_NOME}"
+  printf '    %s%s%s %s %s%s %s%s\n' "$AZUL" "$I_LOGO" "$RESET" "$SLUG" "$FRACO" "$I_SETA" "$RAIZ/{$PROD_NOME,$HML_NOME}" "$RESET"
 done
 if [ "${#PENDENCIAS[@]}" -eq 0 ]; then
   ok "Nenhuma pendência"
-  [ "$DEPLOY" = 1 ] || echo "    Próximo passo: rode de novo com --deploy, ou faça push nas branches"
+  [ "$DEPLOY" = 1 ] || printf '    %s%s%s Próximo passo: rode de novo com --deploy, ou faça push nas branches\n' "$CIANO" "$I_INFO" "$RESET"
 else
-  echo "    Pendências:"
-  for p in "${PENDENCIAS[@]}"; do echo "      - $p"; done
+  printf '    %s%s %d pendência(s):%s\n' "$AMARELO$NEGRITO" "$I_AVISO" "${#PENDENCIAS[@]}" "$RESET"
+  for p in "${PENDENCIAS[@]}"; do printf '      %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$p"; done
 fi
-[ "${DOCKER[0]}" = sudo ] && echo "    Saia e entre de novo na sessão para usar docker sem sudo."
+[ "${DOCKER[0]}" = sudo ] && printf '    %s%s%s Saia e entre de novo na sessão para usar docker sem sudo.\n' "$CIANO" "$I_INFO" "$RESET"
+printf '\n%s%s Concluído em %dmin%02ds%s\n' "$VERDE$NEGRITO" "$I_OK" $((SECONDS / 60)) $((SECONDS % 60)) "$RESET"
 exit 0

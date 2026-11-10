@@ -69,7 +69,7 @@ bash setup-host.sh --sistema meusistema --repo SEMIT-SUAS/meusistema \
   --env-hml NEXTAUTH_URL=http://<IP da VM>:3001
 ```
 
-Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga.
+Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga. As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
 
 No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode o mesmo comando com `--deploy` para o primeiro deploy, homologação primeiro. Depois disso, cada push publica sozinho.
 

@@ -76,7 +76,52 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-falha() { echo "Erro: $1" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Visual: cores só num terminal (NO_COLOR desliga); ícones Unicode só com locale UTF-8
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  NEGRITO=$'\033[1m' FRACO=$'\033[2m' VERMELHO=$'\033[31m' VERDE=$'\033[32m'
+  AMARELO=$'\033[33m' AZUL=$'\033[34m' CIANO=$'\033[36m' RESET=$'\033[0m'
+else
+  NEGRITO="" FRACO="" VERMELHO="" VERDE="" AMARELO="" AZUL="" CIANO="" RESET=""
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}} $(locale charmap 2>/dev/null || true)" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+    I_OK="✔" I_AVISO="⚠" I_ERRO="✖" I_SETA="❯" I_ETAPA="▸" I_LOGO="◆" I_INFO="ℹ"
+    I_MARCADO="◉" I_VAZIO="○" I_ITEM="•" I_NOVO="+" I_MANTIDO="=" I_MOVIDO="↪" I_GIRO="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" ;;
+  *)
+    I_OK="v" I_AVISO="!" I_ERRO="x" I_SETA=">" I_ETAPA="==>" I_LOGO="*" I_INFO="i"
+    I_MARCADO="x" I_VAZIO=" " I_ITEM="-" I_NOVO="+" I_MANTIDO="=" I_MOVIDO="~" I_GIRO='|/-\' ;;
+esac
+
+# Cabeçalho do modo interativo
+banner() {
+  printf '\n  %s%s %s%s  %s%s%s\n' "$NEGRITO$AZUL" "$I_LOGO" "$1" "$RESET" "$FRACO" "$2" "$RESET" >/dev/tty
+  printf '  %sEnter aceita a sugestão entre colchetes · Ctrl+C cancela%s\n' "$FRACO" "$RESET" >/dev/tty
+}
+
+# "? Pergunta [padrão] ❯ "
+rotulo_pergunta() {
+  printf '  %s?%s %s%s%s%s %s%s%s ' "$CIANO" "$RESET" "$NEGRITO" "$1" "$RESET" \
+    "${2:+ $FRACO[$2]$RESET}" "$CIANO" "$I_SETA" "$RESET"
+}
+erro_entrada() { printf '    %s%s %s%s\n' "$VERMELHO" "$I_ERRO" "$1" "$RESET" >/dev/tty; }
+escolhido() { printf '    %s%s%s %s%s%s\n' "$VERDE" "$I_OK" "$RESET" "$FRACO" "$1" "$RESET" >/dev/tty; }
+
+falha() { printf '%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; exit 1; }
+
+# Roda FUNÇÃO com um indicador de progresso; a saída vai para o arquivo SAIDA
+com_espera() {
+  local saida="$1" msg="$2" pid i=0
+  shift 2
+  "$@" >"$saida" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s' "$CIANO" "${I_GIRO:i++%${#I_GIRO}:1}" "$RESET" "$msg" >/dev/tty
+    sleep 0.1
+  done
+  wait "$pid" || true
+  printf '\r%*s\r' $((${#msg} + 6)) '' >/dev/tty
+}
 
 # ---------------------------------------------------------------------------
 # Perguntas do modo interativo (leem de /dev/tty). As opções são "valor|texto mostrado".
@@ -86,10 +131,10 @@ perguntar() {
   local -n __resp_var="$1"
   local texto="$2" padrao="${3:-}" regex="${4:-.}" resp=""
   while true; do
-    read -r -p "  $texto${padrao:+ [$padrao]}: " resp </dev/tty || falha "sem resposta para: $texto"
+    read -r -p "$(rotulo_pergunta "$texto" "$padrao")" resp </dev/tty || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     [[ "$resp" =~ $regex ]] && break
-    echo "    Valor inválido." >/dev/tty
+    erro_entrada "Valor inválido."
   done
   __resp_var="$resp"
 }
@@ -97,30 +142,42 @@ perguntar() {
 # sim_nao "Pergunta" s|n
 sim_nao() {
   local resp=""
-  read -r -p "  $1 [$([ "$2" = s ] && echo S/n || echo s/N)] " resp </dev/tty || falha "sem resposta para: $1"
-  resp="${resp:-$2}"
-  [[ "$resp" =~ ^[sS]$ ]]
+  while true; do
+    read -r -p "$(rotulo_pergunta "$1" "$([ "$2" = s ] && echo S/n || echo s/N)")" resp </dev/tty \
+      || falha "sem resposta para: $1"
+    resp="${resp:-$2}"
+    case "$resp" in
+      [sS]|[sS][iI][mM]) return 0 ;;
+      [nN]|[nN][aAãÃ][oO]) return 1 ;;
+    esac
+    erro_entrada "Responda s ou n."
+  done
 }
 
-# escolher VAR "Pergunta" N_PADRÃO "valor|texto" ...
+# escolher VAR "Pergunta" N_PADRÃO "valor|texto" ...: uma opção, pelo número
 escolher() {
   local -n __esc_var="$1"
   local texto="$2" padrao="$3" i=1 op resp
   shift 3
-  echo "  $texto" >/dev/tty
+  printf '  %s?%s %s%s%s\n' "$CIANO" "$RESET" "$NEGRITO" "$texto" "$RESET" >/dev/tty
   for op in "$@"; do
-    printf '    %d) %s\n' "$i" "${op#*|}" >/dev/tty
+    if [ "$i" = "$padrao" ]; then
+      printf '  %s%s %2d)%s %s\n' "$CIANO" "$I_SETA" "$i" "$RESET" "${op#*|}" >/dev/tty
+    else
+      printf '    %s%2d)%s %s\n' "$FRACO" "$i" "$RESET" "${op#*|}" >/dev/tty
+    fi
     i=$((i + 1))
   done
   while true; do
-    read -r -p "  Escolha [$padrao]: " resp </dev/tty || falha "sem resposta para: $texto"
+    read -r -p "    Escolha $FRACO[$padrao]$RESET $CIANO$I_SETA$RESET " resp </dev/tty || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     if [[ "$resp" =~ ^[0-9]+$ ]] && [ "$resp" -ge 1 ] && [ "$resp" -le $# ]; then
       op="${!resp}"
       __esc_var="${op%%|*}"
+      [[ "$__esc_var" == __* ]] || escolhido "${op#*|}"  # "outra": a próxima pergunta já mostra
       return
     fi
-    echo "    Digite um número de 1 a $#." >/dev/tty
+    erro_entrada "Digite um número de 1 a $#."
   done
 }
 
@@ -170,14 +227,17 @@ fi
 
 if [ "$INTERATIVO" = 1 ]; then
   { : </dev/tty; } 2>/dev/null || falha "o modo interativo precisa de um terminal"
-  echo "scaffold.sh $VERSAO: gera os arquivos de deploy no repositório (Enter aceita o valor entre colchetes)"
-  echo
+  trap 'printf "\n\n  %s%s Cancelado: nada foi alterado.%s\n" "$AMARELO" "$I_AVISO" "$RESET" >/dev/tty; exit 130' INT
+  banner "scaffold.sh $VERSAO" "arquivos de deploy blue-green para o repositório"
+  echo >/dev/tty
 
   if [ -z "$DESTINO" ]; then
     atual=""
     if git rev-parse --show-toplevel >/dev/null 2>&1; then atual="$(git rev-parse --show-toplevel)"; fi
-    echo "  Procurando repositórios git..." >/dev/tty
-    mapfile -t repos < <(listar_repos "$atual")
+    lista="$(mktemp)"
+    com_espera "$lista" "Procurando repositórios git..." listar_repos "$atual"
+    mapfile -t repos <"$lista"
+    rm -f "$lista"
     if [ "${#repos[@]}" -eq 0 ]; then
       perguntar DESTINO "Pasta do repositório do sistema" "${atual:-.}"
     else
@@ -185,8 +245,8 @@ if [ "$INTERATIVO" = 1 ]; then
       for r in "${repos[@]}"; do
         rotulo="${r/#$HOME/\~}"
         ramo="$(git -C "$r" symbolic-ref --short -q HEAD 2>/dev/null || true)"
-        [ -n "$ramo" ] && rotulo="$rotulo  ($ramo)"
-        [ "$r" = "$atual" ] && { rotulo="$rotulo  <- pasta atual"; n=$i; }
+        [ -n "$ramo" ] && rotulo="$rotulo  $FRACO$ramo$RESET"
+        [ "$r" = "$atual" ] && { rotulo="$rotulo  $CIANO← pasta atual$RESET"; n=$i; }
         opcoes+=("$r|$rotulo")
         i=$((i + 1))
       done
@@ -310,13 +370,24 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "$PROD_NOME" != production ]; then cmd+=" --prod-nome $PROD_NOME"; fi
   if [ "$HML_NOME" != developer ]; then cmd+=" --hml-nome $HML_NOME"; fi
   if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --substituir-ci"; fi
-  printf '\n  Comando equivalente, para repetir sem perguntas:\n    %s %s\n\n' "$cmd" "$DESTINO"
-  sim_nao "Gerar os arquivos?" s || { echo "Nada foi alterado."; exit 0; }
+  # Alinha pelo número de letras: o %-13s do printf conta bytes e desalinha com acentos
+  linha() { printf '    %s%s%*s%s %s\n' "$FRACO" "$1" $((13 - ${#1})) '' "$RESET" "$2" >/dev/tty; }
+  printf '\n  %s%s Resumo%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET" >/dev/tty
+  linha Repositório "${DESTINO/#$HOME/\~}"
+  linha Sistema "$SISTEMA"
+  linha Produção "$DOMINIO_PROD  ${FRACO}branch $PROD_BRANCH$RESET"
+  linha Homologação "$DOMINIO_HML  ${FRACO}porta $PORTA_HML na VM · branch $HML_BRANCH$RESET"
+  linha CI "$CI$([ "$SUBSTITUIR_CI" = 1 ] && echo "  ${FRACO}(o atual vai para .bak)$RESET")"
+  linha Stack "${STACK:-nenhuma}"
+  printf '\n  %s%s Para repetir sem perguntas:%s\n    %s%s %s%s\n\n' "$FRACO" "$I_INFO" "$RESET" "$CIANO" "$cmd" "$DESTINO" "$RESET" >/dev/tty
+  sim_nao "Gerar os arquivos?" s || { printf '  %s%s Nada foi alterado.%s\n' "$AMARELO" "$I_AVISO" "$RESET"; exit 0; }
+  trap - INT
+  echo
 fi
 
 if [ "$CI_ANTIGO" = 1 ] && [ "$SUBSTITUIR_CI" = 1 ]; then
   mv "$DESTINO/$ARQ_CI" "$DESTINO/$ARQ_CI.bak"
-  echo "  ~ $ARQ_CI antigo movido para $ARQ_CI.bak"
+  printf '  %s%s%s %s antigo movido para %s.bak\n' "$AMARELO" "$I_MOVIDO" "$RESET" "$ARQ_CI" "$ARQ_CI"
 fi
 
 # Troca só os marcadores conhecidos: as expressões {{ ... }} do GitHub e do Docker ficam intactas
@@ -337,15 +408,18 @@ preencher() {
 gerar() {
   local origem="$1" destino="$DESTINO/$2"
   if [ -e "$destino" ]; then
-    echo "  = $2 já existe, mantido"
+    printf '  %s%s %s  (já existe, mantido)%s\n' "$FRACO" "$I_MANTIDO" "$2" "$RESET"
+    MANTIDOS=$((MANTIDOS + 1))
     return
   fi
   mkdir -p "$(dirname "$destino")"
   preencher < "$AQUI/modelos/$origem" > "$destino"
-  echo "  + $2"
+  printf '  %s%s%s %s\n' "$VERDE" "$I_NOVO" "$RESET" "$2"
+  CRIADOS=$((CRIADOS + 1))
 }
 
-echo "Gerando em $DESTINO:"
+CRIADOS=0 MANTIDOS=0
+printf '%s%s Gerando em %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$DESTINO" "$RESET"
 gerar deploy.sh deploy.sh
 chmod +x "$DESTINO/deploy.sh" 2>/dev/null || true
 COR=blue gerar compose.cor.yml compose.blue.yml
@@ -361,7 +435,7 @@ fi
 
 # Arquivos da stack: copiados como estão, sem sobrescrever
 if [ -n "$STACK" ]; then
-  echo "Stack $STACK:"
+  printf '%s%s Stack %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$STACK" "$RESET"
   ex="$AQUI/examples/$STACK"
   while IFS= read -r arquivo; do
     rel="${arquivo#"$ex"/}"
@@ -372,36 +446,41 @@ if [ -n "$STACK" ]; then
         touch "$DESTINO/.gitignore"
         while IFS= read -r linha; do
           [[ -z "$linha" || "$linha" == \#* ]] && continue
-          grep -qxF "$linha" "$DESTINO/.gitignore" || { echo "$linha" >> "$DESTINO/.gitignore"; echo "  + .gitignore: $linha"; }
+          grep -qxF "$linha" "$DESTINO/.gitignore" || { echo "$linha" >> "$DESTINO/.gitignore"; printf '  %s%s%s .gitignore: %s\n' "$VERDE" "$I_NOVO" "$RESET" "$linha"; }
         done < "$arquivo"
         continue
         ;;
     esac
     if [ -e "$DESTINO/$rel" ]; then
-      echo "  = $rel já existe, mantido"
+      printf '  %s%s %s  (já existe, mantido)%s\n' "$FRACO" "$I_MANTIDO" "$rel" "$RESET"
+      MANTIDOS=$((MANTIDOS + 1))
     else
       mkdir -p "$(dirname "$DESTINO/$rel")"
       cp "$arquivo" "$DESTINO/$rel"
-      echo "  + $rel"
+      printf '  %s%s%s %s\n' "$VERDE" "$I_NOVO" "$RESET" "$rel"
+      CRIADOS=$((CRIADOS + 1))
     fi
   done < <(find "$ex" -type f | sort)
 fi
 
 # Marcador esquecido em algum modelo
 if grep -rnoE '\{\{[A-Z_]+\}\}' "$DESTINO"/deploy.sh "$DESTINO"/compose.*.yml "$DESTINO"/nginx 2>/dev/null; then
-  echo "Atenção: sobraram marcadores acima sem valor" >&2
+  printf '%s%s Atenção: sobraram marcadores acima sem valor%s\n' "$AMARELO" "$I_AVISO" "$RESET" >&2
 fi
 
 echo
-echo "Falta fazer no repositório:"
+printf '%s%s %d arquivo(s) criado(s)%s%s\n' "$VERDE" "$I_OK" "$CRIADOS" "$RESET" \
+  "$([ "$MANTIDOS" -gt 0 ] && echo "$FRACO, $MANTIDOS já existiam e foram mantidos$RESET")"
+echo
+printf '%s%s Falta fazer no repositório:%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
+item() { printf '  %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$1"; }
 if [ -z "$STACK" ]; then
-  cat <<EOF
-  - Dockerfile, se ainda não houver
-  - a rota $HEALTH, respondendo 200 só com a aplicação pronta (e sem exigir login)
-  - compose.migrate.yml, se o sistema tiver migração de banco (veja o README)
-  - .env.example com as variáveis do sistema
-EOF
+  item "Dockerfile, se ainda não houver"
+  item "a rota $HEALTH, respondendo 200 só com a aplicação pronta (e sem exigir login)"
+  item "compose.migrate.yml, se o sistema tiver migração de banco (veja o README)"
+  item ".env.example com as variáveis do sistema"
 else
-  echo "  - revisar os arquivos copiados de examples/$STACK (veja o README da stack)"
+  item "revisar os arquivos copiados de examples/$STACK (veja o README da stack)"
 fi
-echo '  - os testes no job "test" do CI'
+item 'os testes no job "test" do CI'
+item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"
