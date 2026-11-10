@@ -1,0 +1,40 @@
+# Push na {{HML_BRANCH}} publica em homologação; push na {{PROD_BRANCH}}, em produção.
+# Gerado pelo zero-downtime-deploy (modelos/gitlab-ci.yml). Inclua os testes do sistema no job test.
+stages: [test, deploy]
+
+test:
+  stage: test
+  # Runner compartilhado do GitLab; troque a imagem pela do sistema
+  image: alpine:3.20
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}" || $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
+  script:
+    # Testes do sistema aqui (ex.: npm ci && npm test, ./mvnw verify)
+    - echo "sem testes configurados"
+
+.deploy:
+  stage: deploy
+  # Runner da VM (executor shell), registrado com a tag do sistema
+  tags: [{{SISTEMA}}]
+  script:
+    - cd "/opt/{{SISTEMA}}/$ENV_NAME"
+    - git fetch origin
+    - git reset --hard "origin/$CI_COMMIT_BRANCH"
+    - bash deploy.sh "$ENV_NAME"
+
+# Um job por ambiente: o resource_group fixo garante um deploy por vez em cada um.
+# GIT_STRATEGY none: não clona, atualiza a pasta do ambiente em /opt.
+deploy_{{HML_NOME}}:
+  extends: .deploy
+  resource_group: {{HML_NOME}}
+  variables: { ENV_NAME: "{{HML_NOME}}", GIT_STRATEGY: none }
+  rules:
+    - if: $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
+
+deploy_{{PROD_NOME}}:
+  extends: .deploy
+  resource_group: {{PROD_NOME}}
+  variables: { ENV_NAME: "{{PROD_NOME}}", GIT_STRATEGY: none }
+  rules:
+    - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}"

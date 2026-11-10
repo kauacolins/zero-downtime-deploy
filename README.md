@@ -1,125 +1,213 @@
 # Deploy zero downtime com Docker e Nginx
 
-Modelo de deploy blue-green para um servidor único, com Docker Compose, Nginx em contêiner e GitHub Actions em runner self-hosted. Foi feito para Next.js com Prisma, mas a ideia serve para outras stacks.
+Deploy **blue-green** com **homologação e produção na mesma VM**, para qualquer sistema em contêiner. Cada push publica sozinho, sem tirar o sistema do ar.
+
+| Arquivo | Onde roda | Para quê |
+| --- | --- | --- |
+| [`setup-host.sh`](setup-host.sh) | Na VM | Prepara a VM para um sistema: Docker, pastas, `.env`, banco de homologação, runner |
+| [`scaffold.sh`](scaffold.sh) | Na sua máquina | Gera no repositório do sistema os arquivos de deploy, a partir dos [`modelos/`](modelos) |
+| [`examples/`](examples) | | Arquivos específicos de cada stack, como o [`Dockerfile` de Next.js com Prisma](examples/nextjs-prisma) |
+
+A versão 1, com um ambiente só em `/var/www/app`, continua na tag `v1.0.0`. Veja o [CHANGELOG](CHANGELOG.md).
 
 ## Como funciona
 
+Cada ambiente tem duas "cores", blue e green. O deploy sobe a versão nova na cor livre, espera ela responder na rota de saúde e só então troca o destino do Nginx. Se a versão nova não ficar saudável, nada muda para o usuário.
+
+```text
+                     ┌──────────────────────────── VM ────────────────────────────┐
+dominio-prod :80 ──► │ nginx ─► production.inc ─► sistema_blue_app | sistema_green_app │
+dominio-hml  :80 ──► │   │                                                         │
+IP da VM   :3001 ──► │   └────► developer.inc ─► sistema_hml_blue_app | ..._green_app  │
+                     └─────────────────────────────────────────────────────────────┘
+push na main ─► runner na VM ─► /opt/<sistema>/production ─► bash deploy.sh production
+push na dev  ─► runner na VM ─► /opt/<sistema>/developer  ─► bash deploy.sh developer
 ```
-Usuário → Nginx (contêiner, porta 80) → upstream app → blue_app:3000 ou green_app:3000
-                                                              ↓
-                                               banco (no servidor) e ./uploads
+
+O `deploy.sh` de cada sistema faz, nesta ordem:
+
+1. Confere se a pasta e o banco do `.env` são do ambiente certo (o de homologação termina em `_hml`).
+2. Escolhe a cor livre. No primeiro deploy, usa `blue`.
+3. Compila a imagem. Um erro de build não deixa o banco à frente da versão no ar.
+4. Roda as migrações, se houver um `compose.migrate.yml`.
+5. Sobe a cor livre e espera o health check, por até 2 minutos. Se falhar, derruba a versão nova e encerra com erro.
+6. Grava a cor ativa em `/opt/<sistema>/nginx/<ambiente>.inc` e faz `nginx -s reload`, que não derruba conexões.
+7. Espera 10 segundos e derruba a cor antiga.
+
+## Uso rápido
+
+### 1. Gere os arquivos de deploy no repositório do sistema
+
+Na sua máquina:
+
+```bash
+git clone https://github.com/kauacolins/zero-downtime-deploy.git
+bash zero-downtime-deploy/scaffold.sh --sistema meusistema \
+  --dominio-prod meusistema.saoluis.ma.gov.br --dominio-hml hml-meusistema.saoluis.ma.gov.br \
+  --stack nextjs-prisma  ../meusistema
 ```
 
-Só o Nginx expõe porta. As duas cores usam a porta 3000 dentro da rede Docker `web`, e o arquivo `nginx/upstream.conf` indica qual está ativa.
+O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
 
-O `deploy.sh` faz o seguinte:
+### 2. Prepare a VM
 
-1. Lê a cor ativa e escolhe a outra. No primeiro deploy, usa `blue`.
-2. Roda as migrações, com a versão atual ainda no ar.
-3. Constrói e sobe a cor ociosa.
-4. Espera o health check. Se falhar, derruba a versão nova e encerra com erro, sem tocar no tráfego.
-5. Regrava o `upstream` e faz `nginx -s reload`, que não derruba conexões. Se falhar, restaura o arquivo anterior.
-6. Espera 10 segundos e derruba a cor antiga.
+Entre na VM com o **usuário do deploy** (não root, com sudo):
 
-## Arquivos
+```bash
+curl -fsSLO https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh
 
-| Arquivo | Função |
+# GitHub: o token permite cadastrar a deploy key e o runner sozinho.
+# Pegue com "gh auth token" na sua máquina e cole aqui (não fica no histórico):
+read -rs GH_TOKEN && export GH_TOKEN
+
+bash setup-host.sh --sistema meusistema --repo SEMIT-SUAS/meusistema \
+  --pg-hml meusistema_hml --pg-acesso meusistema:meusistema \
+  --segredos "AUTH_SECRET" --env NODE_ENV=production \
+  --env-prod NEXTAUTH_URL=https://meusistema.saoluis.ma.gov.br \
+  --env-hml NEXTAUTH_URL=http://<IP da VM>:3001
+```
+
+No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode o mesmo comando com `--deploy` para o primeiro deploy, homologação primeiro. Depois disso, cada push publica sozinho.
+
+Para fixar uma versão, troque `master` na URL por uma tag, por exemplo `v2.0.0`. Se este repositório ficar privado, o `curl` precisa de `-H "Authorization: token $GH_TOKEN"`. Ele não guarda segredos, então pode ser público.
+
+## O que o `setup-host.sh` faz
+
+Cada etapa confere se já está feita antes de agir, então o script pode ser rodado de novo quantas vezes for preciso.
+
+| Etapa | O que faz |
 | --- | --- |
-| `Dockerfile` | Imagem do app (`runner`) e das migrações (`migrate`) |
-| `docker-compose.blue.yml`, `docker-compose.green.yml` | Uma cor do app em cada arquivo |
-| `docker-compose.nginx.yml` | Nginx, que não é reimplantado |
-| `docker-compose.yaml` | Serviço de migrações |
-| `nginx/default.conf` | Rota padrão: encaminha tudo para o `upstream app` |
-| `nginx/upstream.conf` | Cor ativa; gerado pelo `deploy.sh`, fora do Git |
-| `deploy.sh` | Faz a troca de versão |
-| `.github/workflows/deploy.yml` | Roda o deploy a cada push na `main` |
-| `examples/nextjs-prisma/` | Rota `/api/health` e consulta ao banco |
+| Docker | Instala o Docker e o Compose, se faltarem; põe o usuário no grupo `docker`; cria a rede `web` |
+| PM2 | Se a VM roda sistemas pelo PM2 (de qualquer usuário), **pergunta** e roda `pm2 stop all` e `pm2 unstartup` |
+| Portas 80 e 3001 | Se um Nginx as ocupa (da máquina, iniciado à mão ou em contêiner de outro sistema), **pergunta** e o para |
+| Pastas | Cria `/opt/<sistema>` com o usuário do deploy como dono |
+| Repositórios | Gera uma deploy key por repositório, cadastra (GitHub, com token) e clona as branches de produção e de homologação |
+| Arquivos de deploy | Confere se cada repositório tem `deploy.sh`, `Dockerfile`, os composes das cores e o CI |
+| PostgreSQL | Opcional: cria o banco de homologação e libera o acesso da rede Docker |
+| `.env` | Cria a partir do exemplo, gera segredos próprios de cada ambiente e grava os valores passados |
+| Runner | GitHub: instala um runner por repositório, como serviço. GitLab: mostra o passo a passo |
+| Deploy | Opcional (`--deploy`): roda o `deploy.sh` de cada pasta; se homologação falhar, produção não é publicada |
+| Conferência | Avisa sobre contêineres com porta aberta para a rede |
 
-## Como usar em um projeto
+### Nada é apagado
 
-1. Copie para a raiz do projeto tudo o que está aqui, menos `README.md`, `examples/` e `.gitignore`. Junte as regras desse `.gitignore` às do projeto.
-2. Copie o conteúdo de `examples/nextjs-prisma/src/` para o `src/` do projeto e ajuste o import do Prisma em `health.ts`.
-3. Em `next.config.ts`, use `output: "standalone"`.
-4. Se o middleware exige login, deixe `/api/health` de fora. O health check segue redirecionamentos, então um redirecionamento para a tela de login faria uma versão com problema parecer saudável.
-5. Se alguma página consulta o banco durante o build, use `export const dynamic = "force-dynamic"` nela ou no layout. O build não tem acesso ao banco nem ao `.env`.
-6. Sem Prisma, remova o estágio `migrate` e o `COPY prisma` do `Dockerfile`, o `docker-compose.yaml` e a linha `docker compose run` do `deploy.sh`. Adapte o health check se a stack não for Node.
-7. Se quiser outro caminho no servidor, altere `/var/www/app` em `.github/workflows/deploy.yml`.
-8. Ajuste `client_max_body_size` em `nginx/default.conf` ao maior upload aceito pelo app.
+Tudo o que o script desliga continua na VM e pode ser religado:
 
-## Como preparar o servidor
+| O que foi parado | Como religar |
+| --- | --- |
+| Nginx da máquina | `sudo systemctl enable --now nginx` |
+| Contêiner de outro sistema | `docker update --restart=unless-stopped <nome> && docker start <nome>` |
+| Contêiner `nginx` renomeado | `docker rename nginx-parado-AAAAMMDD nginx` e o comando acima |
+| PM2 | `pm2 resurrect` e `pm2 startup` |
 
-1. Instale o Docker e coloque o usuário do deploy no grupo `docker`.
-2. Clone o repositório do projeto em `/var/www/app`.
-3. Crie o `.env` a partir do `.env.example`.
-4. Crie a pasta `uploads/` com o usuário do deploy. Se o Docker a criar, ela fica como root e os envios falham.
-5. Se o banco roda no servidor, libere a rede Docker no `pg_hba.conf` e no firewall. Confira a faixa com `docker network inspect web`.
-6. Libere a porta 80. Se houver um Nginx na máquina, desabilite-o sem apagar a configuração:
+Segredos que já existem no `.env` nunca são trocados, porque isso derrubaria as sessões abertas.
 
-   ```bash
-   sudo systemctl disable --now nginx
-   ```
+### Opções
 
-## Deploy
+Lista completa em `bash setup-host.sh --help`.
+
+| Opção | Para quê |
+| --- | --- |
+| `--sistema NOME` | Obrigatório. As pastas ficam em `/opt/NOME` |
+| `--repo DONO/REPO[:PASTA[:LABELS]]` | Repetível. Com vários repositórios, cada um fica em `/opt/NOME/PASTA` |
+| `--prod-nome`, `--prod-branch` | Padrão: `production`, `main` |
+| `--hml-nome`, `--hml-branch` | Padrão: `developer`, `dev` |
+| `--segredos "CHAVE ..."` | Chaves do `.env` que recebem um segredo aleatório |
+| `--env`, `--env-prod`, `--env-hml CHAVE=VALOR` | Valores gravados no `.env` dos dois ambientes ou de um só |
+| `--pg-hml NOME` | Cria banco e usuário de homologação no PostgreSQL da máquina |
+| `--pg-acesso BANCO:USUARIO` | Libera um banco para a rede Docker no `pg_hba.conf` |
+| `--gitlab HOST` | Repositórios no GitLab; deploy key e runner ficam manuais |
+| `--sem-clone` | Não clona: para sistemas cujo CI cria as pastas sozinho |
+| `--deploy` | Faz o primeiro deploy no final |
+| `--sim` | Não pergunta antes de parar PM2 e Nginx. **Evite em VM que já atende algum sistema** |
 
 ```bash
-bash deploy.sh
+# Dois repositórios (API e frontend), branch de homologação "homolog"
+bash setup-host.sh --sistema cis --hml-nome homolog --hml-branch homolog \
+  --repo SEMIT-SUAS/cis-api:api --repo SEMIT-SUAS/cis-frontend:frontend:front
+
+# GitLab próprio, com subgrupo
+bash setup-host.sh --sistema sisx --gitlab gitlab.saoluis.ma.gov.br --repo semit/sistemas/sisx
 ```
 
-Se o servidor já tiver um app no ar, reduza a queda da virada construindo antes de liberar a porta:
+### GitHub ou GitLab
 
-```bash
-docker network create web
-docker compose -f docker-compose.blue.yml up -d --build --wait
-sudo systemctl disable --now nginx
-bash deploy.sh
-```
+A preparação da VM é a mesma. Mudam o acesso ao código e o runner:
 
-## CI
+| | GitHub | GitLab (`--gitlab HOST`) |
+| --- | --- | --- |
+| Deploy key | Cadastrada pelo script, com `GH_TOKEN` | Manual: o script mostra a chave e o link |
+| Runner | Instalado pelo script, um por repositório, com a label do sistema | Manual: o script mostra os comandos e confere na execução seguinte |
+| CI | `.github/workflows/deploy.yml` (`scaffold.sh --ci github`) | `.gitlab-ci.yml` (`scaffold.sh --ci gitlab`) |
 
-O workflow usa `runs-on: self-hosted` e roda a cada push na `main`.
-
-1. No GitHub, abra **Settings → Actions → Runners → New self-hosted runner** e siga os comandos, com o usuário do deploy.
-2. Dê a esse usuário acesso de leitura ao repositório, por exemplo com uma deploy key, para o `git pull`.
-3. Instale o runner como serviço, na pasta dele:
-
-   ```bash
-   sudo ./svc.sh install USUARIO
-   sudo ./svc.sh start
-   ```
-
-Instale o runner só depois do primeiro deploy manual, para um merge não disparar um deploy antes de o servidor estar pronto.
+O `GH_TOKEN` precisa de escopo `repo` e de admin nos repositórios. Ele só é usado durante a execução e não fica gravado na VM.
 
 ## Rollback
 
-De `green` para `blue` (inverta as cores no caso contrário). A imagem anterior continua no servidor até o próximo deploy daquela cor:
+A versão anterior continua como imagem na VM, então o rollback leva segundos e não precisa de build. Exemplo em produção, voltando de `green` para `blue`:
 
 ```bash
-docker compose -f docker-compose.blue.yml up -d --wait
-echo "upstream app { server blue_app:3000; }" > nginx/upstream.conf
+cd /opt/<sistema>/production
+export APP_PREFIX=<sistema>_
+docker compose -p <sistema>-blue -f compose.blue.yml up -d --wait
+echo 'set $app_upstream <sistema>_blue_app:3000;' > /opt/<sistema>/nginx/production.inc
 docker exec nginx nginx -t && docker exec nginx nginx -s reload
-docker compose -f docker-compose.green.yml down
+docker compose -p <sistema>-green -f compose.green.yml down
 ```
 
-Para voltar ao Nginx da máquina:
+Em homologação, use a pasta `developer`, `APP_PREFIX=<sistema>_hml_`, os projetos `<sistema>-hml-blue` e `<sistema>-hml-green`, o contêiner `<sistema>_hml_blue_app` e o arquivo `developer.inc`.
 
-```bash
-docker compose -f docker-compose.nginx.yml down
-sudo systemctl enable --now nginx
-```
+Depois do rollback:
+
+1. **Reverta o commit na branch.** Ela ainda aponta para a versão com defeito, e o próximo push a publicaria de novo.
+2. **Não desfaça a migração às pressas.** O rollback não altera o banco. Se a migração foi compatível, a versão antiga funciona com ela.
+
+Só existe uma versão anterior disponível: o deploy seguinte compila na cor livre e substitui essa imagem.
+
+## O que fica com cada sistema
+
+- **`Dockerfile`:** depende da tecnologia. A imagem precisa ter `wget`, `curl` ou `node` para o health check do compose. Há um pronto para [Next.js com Prisma](examples/nextjs-prisma).
+- **Rota de saúde:** responde 200 só quando a aplicação e o banco estão prontos, e sem exigir login.
+- **Migrações compatíveis:** as duas versões usam o mesmo banco durante a troca. Para remover ou renomear uma coluna, primeiro faça a versão nova parar de usá-la e só remova no deploy seguinte.
+- **`.env.example`:** com todas as variáveis. O `setup-host.sh` cria o `.env` a partir dele.
+- **Origens permitidas:** frameworks que conferem a origem do pedido (Next.js Server Actions, Auth.js, CORS) precisam aceitar os domínios e o `IP:3001`.
+- **Estado fora do contêiner:** arquivos em `./uploads` (montada nas duas cores) e sessões em JWT ou armazenamento externo. Sessões em memória se perdem a cada deploy.
+- **Dados de homologação:** o banco nasce vazio. Uma cópia de produção precisa ter os dados pessoais anonimizados (LGPD).
 
 ## Limites e cuidados
 
 **O que ainda pode causar erro ou queda:**
 
-- **Migração incompatível:** as duas versões usam o mesmo banco durante a troca, e o script não detecta incompatibilidade. Para remover ou renomear uma coluna, primeiro faça a versão nova parar de usá-la e só remova no deploy seguinte.
+- **Migração incompatível:** o script não detecta. Veja a regra acima.
 - **Pedidos longos:** um pedido que dure mais de 10 segundos na versão antiga pode ser cortado. Aumente o `sleep` no `deploy.sh`, se necessário.
 - **Páginas abertas:** quem estiver com uma página da versão antiga pode ver um erro na próxima ação, até recarregar.
-- **Memória:** o build roda no servidor, ao lado do app no ar. Em máquinas pequenas, construa a imagem em outro lugar.
-- **Servidor único:** reiniciar o servidor, ou perder o Docker ou o banco, tira o app do ar. Os contêineres voltam sozinhos, mas o Nginx pode reiniciar algumas vezes até o app subir.
+- **Memória:** o build roda na VM, ao lado dos sistemas no ar. Um build de homologação pode deixar produção lenta.
+- **VM única:** se ela parar, os dois ambientes param. Mantenha backup dos bancos e de `uploads/`; o script não configura backup.
 
 **Configuração e segurança:**
 
-- **Uploads:** `./uploads` é compartilhada entre as cores para os arquivos sobreviverem à troca. Sessões em memória se perderiam; use JWT ou um armazenamento externo.
-- **Grupo `docker`:** quem está nele pode virar root na prática. O mesmo vale para o runner e para quem altera um workflow que roda nele. Use só em repositório privado, proteja a `main` e limite o acesso de escrita.
-- **Firewall:** portas publicadas pelo Docker podem passar por fora das regras do `ufw`.
-- **HTTPS:** o Nginx escuta só na porta 80 e espera um proxy na frente, como o Cloudflare. Sem isso, configure os certificados nele.
+- **Um sistema por VM, por enquanto.** Cada sistema traz o próprio contêiner `nginx` nas portas 80 e 3001. Ao preparar um segundo sistema na mesma VM, o `setup-host.sh` para o Nginx do primeiro (depois de perguntar).
+- **Grupo `docker`:** quem está nele pode virar root na prática. O mesmo vale para o runner e para quem altera um workflow que roda nele. Proteja as branches de produção e de homologação e limite o acesso de escrita.
+- **Firewall:** o Docker passa por cima do UFW, então uma porta publicada por um contêiner fica aberta para a rede. Só o Nginx deve publicar portas; o script avisa quando outro contêiner publica.
+- **HTTPS:** o Nginx escuta só nas portas 80 e 3001 e espera um proxy na frente, como o Cloudflare. Sem isso, configure os certificados nele.
+- **Só Ubuntu e Debian**, porque o `setup-host.sh` usa `apt`.
+
+## Problemas comuns
+
+| Sintoma | O que fazer |
+| --- | --- |
+| "Sem acesso de leitura" ao repositório | Cadastre a deploy key mostrada e rode de novo |
+| "não tem a branch" | Crie a branch ou passe `--prod-branch`/`--hml-branch` |
+| `docker: permission denied` depois do script | Saia e entre de novo na sessão (grupo `docker`) |
+| "O Nginx não subiu" | `sudo ss -ltnp \| grep -E ':80 \|:3001 '` mostra quem ocupa a porta |
+| "não ficou saudável" no deploy | O log da cor nova aparece logo acima. Confira o `.env`, o acesso ao banco e a rota de saúde |
+| "aponta para um banco de homologação" | O `.env` foi trocado entre os ambientes. Corrija o endereço do banco |
+| 502 em um só domínio | A cor ativa do ambiente está parada: `docker ps` e `cat /opt/<sistema>/nginx/<ambiente>.inc` |
+| Job do GitLab falha em "prepare environment" | `sed -i '/clear_console/s/^/#/' ~/.bash_logout` no usuário do runner |
+| Job do GitHub parado em "Waiting for a runner" | `sudo ./svc.sh status` na pasta `~/actions-runner-<sistema>` |
+
+## Desenvolvimento
+
+- Os scripts precisam terminar linhas com LF; o [`.gitattributes`](.gitattributes) garante isso no Windows.
+- O CI roda o [ShellCheck](https://www.shellcheck.net/), gera os arquivos de um sistema de exemplo (GitHub e GitLab, com e sem stack), valida os composes e testa a configuração do Nginx.
+- Ao mudar o comportamento, atualize `VERSAO` nos dois scripts, o [`CHANGELOG.md`](CHANGELOG.md) e crie uma tag `vX.Y.Z`.

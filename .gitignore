@@ -1,4 +1,0 @@
-.env
-uploads/
-# gerado pelo deploy.sh
-nginx/upstream.conf
