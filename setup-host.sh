@@ -112,7 +112,8 @@ falha() { printf '\n\033[31mErro: %s\033[0m\n' "$1" >&2; exit 1; }
 confirmar() {
   [ "$SIM" = 1 ] && return 0
   local resp=""
-  read -r -p "    $1 [s/N] " resp </dev/tty 2>/dev/null || return 1
+  # 2> antes de </dev/tty: sem terminal (ssh sem -t, CI), a falha ao abrir não aparece
+  read -r -p "    $1 [s/N] " resp 2>/dev/null </dev/tty || return 1
   [[ "$resp" =~ ^[sS]$ ]]
 }
 
@@ -150,7 +151,8 @@ ler_repo() {
 }
 
 [ "$(id -u)" -ne 0 ] || falha "rode com o usuário do deploy, não como root"
-sudo -v || falha "o usuário $USUARIO precisa de sudo"
+# sudo -n true antes: com NOPASSWD numa regra e senha em outra, o sudo -v pede senha mesmo assim
+sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sudo"
 if [ "$FORGE" = gitlab ]; then
   echo "GitLab ($GIT_HOST): deploy keys e runner ficam manuais; o script mostra o passo a passo."
 elif [ -z "${GH_TOKEN:-}" ]; then
@@ -262,8 +264,8 @@ if systemctl cat nginx.service >/dev/null 2>&1; then
   fi
 fi
 
-# 2. Nginx da máquina iniciado fora do systemd
-if portas_ocupadas | grep -q '"nginx"'; then
+# 2. Nginx da máquina iniciado fora do systemd (o do systemd mantido acima não conta)
+if ! systemctl is-active --quiet nginx 2>/dev/null && portas_ocupadas | grep -q '"nginx"'; then
   if confirmar "Há um processo nginx fora do systemd nas portas 80/3001. Pará-lo (sem apagar a configuração)?"; then
     # Só pelo nginx da máquina: um pkill acertaria também o nginx dos contêineres
     if command -v nginx >/dev/null && sudo nginx -s quit 2>/dev/null; then
@@ -321,8 +323,20 @@ if [ "$CLONAR" = 1 ]; then
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   touch "$HOME/.ssh/config" && chmod 600 "$HOME/.ssh/config"
   # A porta de um endereço como servidor:8443 é a da web, não a do SSH
-  SSH_HOST="${GIT_HOST%%:*}"
-  ssh-keygen -F "$SSH_HOST" >/dev/null 2>&1 || ssh-keyscan -t ed25519 "$SSH_HOST" 2>/dev/null >> "$HOME/.ssh/known_hosts"
+  SSH_HOST="${GIT_HOST%%:*}" SSH_PORTA=22
+  # Rede que bloqueia a porta 22: o GitHub também aceita SSH em ssh.github.com:443
+  if ! timeout 5 bash -c "</dev/tcp/$SSH_HOST/22" 2>/dev/null; then
+    if [ "$FORGE" = github ]; then
+      SSH_HOST=ssh.github.com SSH_PORTA=443
+      ok "Porta 22 bloqueada: SSH do GitHub por $SSH_HOST:$SSH_PORTA"
+    else
+      aviso "Porta 22 de $SSH_HOST inacessível: o clone por SSH vai falhar"
+    fi
+  fi
+  known="$SSH_HOST"; [ "$SSH_PORTA" = 22 ] || known="[$SSH_HOST]:$SSH_PORTA"
+  ssh-keygen -F "$known" >/dev/null 2>&1 \
+    || ssh-keyscan -p "$SSH_PORTA" -t ed25519 "$SSH_HOST" 2>/dev/null >> "$HOME/.ssh/known_hosts" \
+    || aviso "ssh-keyscan $SSH_HOST:$SSH_PORTA falhou: confira o acesso da VM ao $GIT_HOST"
 
   for spec in "${REPOS[@]}"; do
     ler_repo "$spec"
@@ -330,8 +344,8 @@ if [ "$CLONAR" = 1 ]; then
 
     [ -f "$CHAVE_SSH" ] || ssh-keygen -t ed25519 -N "" -C "$USUARIO@$(hostname) $SLUG" -f "$CHAVE_SSH" -q
     if ! grep -qx "Host $HOST_SSH" "$HOME/.ssh/config"; then
-      printf '\nHost %s\n  HostName %s\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n' \
-        "$HOST_SSH" "$SSH_HOST" "$CHAVE_SSH" >> "$HOME/.ssh/config"
+      printf '\nHost %s\n  HostName %s\n  Port %s\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n' \
+        "$HOST_SSH" "$SSH_HOST" "$SSH_PORTA" "$CHAVE_SSH" >> "$HOME/.ssh/config"
     fi
 
     if ! GIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote "$url" >/dev/null 2>&1; then
