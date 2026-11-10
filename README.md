@@ -89,9 +89,13 @@ O script guarda as respostas e onde parou em `~/.local/state/zero-downtime-deplo
 Se o sistema já roda na VM de outro jeito (por exemplo, o deploy antigo com `git pull` e PM2 em `/home/suas/sistema`), o script acha a pasta pelo remoto do git e pergunta se deve aproveitá-la (`--origem PASTA`). O código continua vindo do clone. Da instalação atual vêm só:
 
 - **o `.env`**: os valores de produção, com `localhost` do banco trocado por `host.docker.internal`. Assim o `AUTH_SECRET` é o mesmo e quem está logado continua logado. A homologação recebe os mesmos valores, menos banco e URLs do próprio ambiente.
-- **os arquivos enviados pelos usuários** (as pastas montadas, como `public/uploads`), só para a produção. A cada execução, o script traz o que é novo; rode de novo logo antes da troca para não perder nada. Nada é apagado no destino nem na origem. As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
+- **os arquivos enviados pelos usuários** (as pastas montadas, como `public/uploads`), só para a produção. A cada execução, o script traz o que é novo; rode de novo logo antes da troca para não perder nada. Nada é apagado no destino nem na origem.
 
-No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode o mesmo comando com `--deploy` para o primeiro deploy, homologação primeiro. Depois disso, cada push publica sozinho.
+As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
+
+No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode de novo escolhendo fazer o deploy (ou com `--deploy`), homologação primeiro. Depois disso, cada push publica sozinho.
+
+Se a VM já atende um sistema (PM2, Nginx da máquina ou contêiner de outro sistema nas portas 80/3001), nada disso é parado ao preparar a VM. No primeiro deploy, o script compila antes as imagens novas, com o sistema atual no ar; só então pergunta e para o que ocupa as portas e publica. O site fica fora do ar só durante a troca, cerca de 1 minuto. Se o deploy falhar, o que foi parado é religado sozinho. Enquanto o sistema atual estiver no ar, o primeiro deploy precisa ser por aqui: pelo push, o Nginx novo não subiria com a porta 80 ocupada.
 
 Para fixar uma versão, troque `master` na URL por uma tag, por exemplo `v2.0.0`. Se este repositório ficar privado, o `curl` precisa de `-H "Authorization: token $GH_TOKEN"`. Ele não guarda segredos, então pode ser público.
 
@@ -102,15 +106,15 @@ Cada etapa confere se já está feita antes de agir, então o script pode ser ro
 | Etapa | O que faz |
 | --- | --- |
 | Docker | Instala o Docker e o Compose, se faltarem; põe o usuário no grupo `docker`; cria a rede `web` |
-| PM2 | Se a VM roda sistemas pelo PM2 (de qualquer usuário), **pergunta** e roda `pm2 stop all` e `pm2 unstartup` |
-| Portas 80 e 3001 | Se um Nginx as ocupa (da máquina, iniciado à mão ou em contêiner de outro sistema), **pergunta** e o para |
+| Sistema atual | Lista o que ocupa as portas 80/3001 (Nginx da máquina, nginx iniciado à mão, contêiner de outro sistema) e os processos do PM2. **Não para nada**: isso fica para o deploy |
 | Pastas | Cria `/opt/<sistema>` com o usuário do deploy como dono |
 | Repositórios | Gera uma deploy key por repositório, cadastra (GitHub, com token) e clona as branches de produção e de homologação |
 | Arquivos de deploy | Confere se cada repositório tem `deploy.sh`, `Dockerfile`, os composes das cores e o CI |
-| PostgreSQL | Opcional: cria o banco de homologação e libera o acesso da rede Docker |
-| `.env` | Cria a partir do exemplo, gera segredos próprios de cada ambiente e grava os valores passados |
+| Banco de homologação | Opcional (`--pg-hml`): cria o banco e o usuário, e o endereço entra no `.env` de homologação |
+| `.env` | Cria a partir do exemplo, gera segredos próprios de cada ambiente, preenche `NEXTAUTH_URL` e afins com o endereço de cada ambiente (lido do `nginx/default.conf`) e grava os valores passados. URLs de banco são pedidas sem eco na tela |
+| Acesso ao PostgreSQL | Libera no `pg_hba.conf` os bancos do `DATABASE_URL`/`DIRECT_URL` de cada `.env` (os que apontam para `host.docker.internal`), sem perguntar. Avisa de regras `trust` abertas e de banco exposto com o firewall desligado |
 | Runner | GitHub: instala um runner por repositório, como serviço. GitLab: mostra o passo a passo |
-| Deploy | Opcional (`--deploy`): roda o `deploy.sh` de cada pasta; se homologação falhar, produção não é publicada |
+| Deploy | Opcional (`--deploy`): compila as imagens com o sistema atual no ar, para o que ocupa as portas (perguntando) e roda o `deploy.sh` de cada pasta, homologação primeiro. Se falhar, religa o sistema anterior |
 | Conferência | Avisa sobre contêineres com porta aberta para a rede |
 
 ### Nada é apagado
@@ -122,7 +126,7 @@ Tudo o que o script desliga continua na VM e pode ser religado:
 | Nginx da máquina | `sudo systemctl enable --now nginx` |
 | Contêiner de outro sistema | `docker update --restart=unless-stopped <nome> && docker start <nome>` |
 | Contêiner `nginx` renomeado | `docker rename nginx-parado-AAAAMMDD nginx` e o comando acima |
-| PM2 | `pm2 resurrect` e `pm2 startup` |
+| PM2 | `pm2 start <ids>` e `sudo systemctl enable pm2-<usuário>` (o script mostra os comandos exatos no fim do deploy) |
 
 Segredos que já existem no `.env` nunca são trocados, porque isso derrubaria as sessões abertas.
 

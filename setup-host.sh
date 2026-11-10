@@ -55,7 +55,8 @@ Opções:
                           repetíveis; gravam só no .env daquele ambiente (ex.: NEXTAUTH_URL)
   --pg-hml NOME           cria banco e usuário NOME no PostgreSQL da máquina
   --pg-acesso BANCO:USUARIO
-                          repetível; libera o banco para a rede Docker no pg_hba.conf
+                          repetível; libera o banco para a rede Docker no pg_hba.conf. Os bancos
+                          do DATABASE_URL/DIRECT_URL de cada .env já são liberados sem a opção
   --origem [DONO/REPO=]PASTA
                           instalação atual do sistema na VM (ex.: o deploy antigo pelo PM2). A
                           produção recebe os valores do .env dela e os arquivos enviados pelos
@@ -176,6 +177,9 @@ etapa() {
 }
 ok() { printf '    %s%s%s %s\n' "$VERDE" "$I_OK" "$RESET" "$1"; }
 aviso() { printf '    %s%s %s%s\n' "$AMARELO" "$I_AVISO" "$1" "$RESET"; PENDENCIAS+=("$1"); }
+# Atenção que não impede o deploy: aparece no resumo, separada das pendências
+NOTAS=()
+nota() { printf '    %s%s %s%s\n' "$AMARELO" "$I_AVISO" "$1" "$RESET"; NOTAS+=("$1"); }
 falha() { printf '\n%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; exit 1; }
 
 confirmar() {
@@ -192,12 +196,23 @@ confirmar() {
 # Perguntas do modo interativo. Leem de /dev/tty: funcionam também com curl ... | bash.
 # As opções de escolher/escolher_varios são "valor|texto mostrado".
 
+# read com edição de linha (setas, Home, End). Os códigos de cor do prompt vão entre \001 e \002,
+# senão o readline erra a largura da linha. Caracteres de controle saem da resposta: sem isso, uma
+# seta apertada sem querer gravava "^[[A" no valor.
+ler_linha() {
+  local -n __ll="$1"
+  local prompt
+  prompt="$(sed $'s/\033\\[[0-9;]*m/\001&\002/g' <<<"$2")"
+  read -e -r -p "$prompt" __ll </dev/tty || return 1
+  __ll="$(tr -d '\000-\037\177' <<<"$__ll")"
+}
+
 # perguntar VAR "Pergunta" [padrão] [regex]: sem regex, a resposta é obrigatória
 perguntar() {
   local -n __resp_var="$1"
   local texto="$2" padrao="${3:-}" regex="${4:-.}" resp=""
   while true; do
-    read -r -p "$(rotulo_pergunta "$texto" "$padrao")" resp </dev/tty || falha "sem resposta para: $texto"
+    ler_linha resp "$(rotulo_pergunta "$texto" "$padrao")" || falha "sem resposta para: $texto"
     resp="${resp:-$padrao}"
     [[ "$resp" =~ $regex ]] && break
     erro_entrada "Valor inválido."
@@ -253,6 +268,8 @@ perguntar_segredo() {
   local resp=""
   read -rs -p "$(rotulo_pergunta "$2" "oculto")" resp </dev/tty || true
   echo >/dev/tty
+  # Sem edição de linha aqui (-s): uma seta chega como sequência inteira (ESC [ A), que sai toda
+  resp="$(sed $'s/\033\\[[0-9;?]*[A-Za-z~]//g; s/\033O[A-Za-z]//g' <<<"$resp" | tr -d '\000-\037\177')"
   if [ -n "$resp" ]; then
     escolhido "recebido (${#resp} caracteres, não exibido)"
   else
@@ -362,6 +379,188 @@ ler_repo() {
 sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sudo"
 
 # ---------------------------------------------------------------------------
+# Sistema atual: o que já atende as portas 80/3001 (Nginx da máquina, contêineres de outros
+# sistemas) e os processos do PM2. Nada é parado ao detectar: só no primeiro deploy, depois de
+# compiladas as imagens novas, para o site ficar fora do ar o mínimo possível. Se o deploy
+# falhar, o que foi parado é religado.
+
+ATUAL_PM2=()          # "dono|pm2_home|node|pm2|ids online separados por espaço"
+ATUAL_NGINX_HOST=0    # Nginx da máquina ativo (systemd)
+ATUAL_NGINX_SOLTO=0   # nginx fora do systemd nas portas
+ATUAL_CONTEINERES=()  # contêineres de outros sistemas nas portas 80/3001
+REVERTER=()           # comandos que religam o que foi parado, na ordem em que foi parado
+
+portas_ocupadas() { sudo ss -ltnpH '( sport = :80 or sport = :3001 )' | grep -v docker-proxy || true; }
+
+pm2_como() {
+  local dono="$1" home="$2" node_bin="$3" pm2_bin="$4"
+  shift 4
+  sudo -u "$dono" env PATH="$(dirname "$node_bin"):/usr/local/bin:/usr/bin:/bin" PM2_HOME="$home" "$pm2_bin" "$@"
+}
+
+detectar_sistema_atual() {
+  local pid dono home node_bin pm2_bin ids c portas d
+  ATUAL_PM2=() ATUAL_NGINX_HOST=0 ATUAL_NGINX_SOLTO=0 ATUAL_CONTEINERES=()
+  for pid in $(pgrep -f 'PM2 v[0-9.]+: God Daemon' || true); do
+    dono="$(ps -o user= -p "$pid" | tr -d ' ')"
+    home="$(tr '\0' ' ' < "/proc/$pid/cmdline" | sed -nE 's/.*\((.*)\).*/\1/p')"
+    # O pm2 fica ao lado do node que roda o daemon (instalação global ou nvm)
+    node_bin="$(sudo readlink -f "/proc/$pid/exe")"
+    pm2_bin="$(dirname "$node_bin")/pm2"
+    [ -x "$pm2_bin" ] || pm2_bin="$(command -v pm2 || true)"
+    if [ -z "$pm2_bin" ]; then
+      aviso "PM2 de $dono ($home) em execução, mas não achei o executável pm2: pare os processos dele à mão"
+      continue
+    fi
+    ids="$(pm2_como "$dono" "$home" "$node_bin" "$pm2_bin" jlist 2>/dev/null | sudo -u "$dono" "$node_bin" -e '
+      let d = "";
+      process.stdin.on("data", c => (d += c)).on("end", () => {
+        const i = d.indexOf("[");
+        if (i < 0) return;
+        const ids = JSON.parse(d.slice(i)).filter(p => p.pm2_env.status === "online").map(p => p.pm_id);
+        console.log(ids.join(" "));
+      });' 2>/dev/null || true)"
+    if [ -n "$ids" ]; then
+      ATUAL_PM2+=("$dono|$home|$node_bin|$pm2_bin|$ids")
+      printf '    PM2 de %s (%s) com %d processo(s) rodando:\n' "$dono" "$home" "$(wc -w <<<"$ids")"
+      pm2_como "$dono" "$home" "$node_bin" "$pm2_bin" ls --no-color 2>/dev/null | sed 's/^/      /'
+    fi
+  done
+
+  if systemctl cat nginx.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet nginx; then
+      ATUAL_NGINX_HOST=1
+      echo "    O Nginx instalado na máquina está ativo e ocupa a porta 80."
+    elif systemctl is-enabled --quiet nginx 2>/dev/null; then
+      # Parado, mas voltaria no próximo boot e tomaria a porta 80 antes do Docker
+      sudo systemctl disable nginx >/dev/null 2>&1
+      ok "Nginx da máquina já estava parado; desabilitado para não voltar no boot"
+    fi
+  fi
+  if [ "$ATUAL_NGINX_HOST" = 0 ] && portas_ocupadas | grep -q '"nginx"'; then
+    ATUAL_NGINX_SOLTO=1
+    echo "    Há um processo nginx fora do systemd nas portas 80/3001."
+  fi
+
+  for c in $("${DOCKER[@]}" ps --format '{{.Names}}'); do
+    portas="$("${DOCKER[@]}" port "$c" 2>/dev/null | grep -E ':(80|3001)$' || true)"
+    [ -n "$portas" ] || continue
+    d="$("${DOCKER[@]}" inspect "$c" -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
+    if [[ -n "$d" && "$d" == "$BASE"* ]]; then ok "Contêiner $c já é deste sistema"; continue; fi
+    ATUAL_CONTEINERES+=("$c")
+    echo "    O contêiner $c ($("${DOCKER[@]}" inspect "$c" -f '{{.Config.Image}}'), de ${d:-origem desconhecida}) ocupa a porta 80 ou 3001."
+  done
+
+  # Um contêiner parado chamado nginx impediria o deploy de criar o deste sistema com o mesmo nome
+  if "${DOCKER[@]}" inspect nginx >/dev/null 2>&1; then
+    d="$("${DOCKER[@]}" inspect nginx -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
+    if [[ "$d" != "$BASE"* ]] && [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' nginx)" != true ]; then
+      "${DOCKER[@]}" rename nginx "nginx-parado-$(date +%Y%m%d)"
+      ok "Contêiner nginx parado de ${d:-outro sistema} renomeado para nginx-parado-$(date +%Y%m%d) (não foi apagado)"
+    fi
+  fi
+}
+
+tem_sistema_atual() {
+  [ "${#ATUAL_PM2[@]}" -gt 0 ] || [ "$ATUAL_NGINX_HOST" = 1 ] || [ "$ATUAL_NGINX_SOLTO" = 1 ] \
+    || [ "${#ATUAL_CONTEINERES[@]}" -gt 0 ]
+}
+
+# Para o que detectar_sistema_atual achou, perguntando antes de cada coisa. Cada parada entra em
+# REVERTER. Falha se as portas 80/3001 continuarem ocupadas.
+parar_sistema_atual() {
+  local e dono home node_bin pm2_bin ids unidade c pm2_dir
+  for e in "${ATUAL_PM2[@]}"; do
+    IFS='|' read -r dono home node_bin pm2_bin ids <<<"$e"
+    if confirmar "Parar os processos do PM2 de $dono (ids $ids)? Nada é apagado"; then
+      # shellcheck disable=SC2086
+      pm2_como "$dono" "$home" "$node_bin" "$pm2_bin" stop $ids >/dev/null
+      pm2_dir="$(dirname "$node_bin")"
+      REVERTER+=("sudo -u $dono env PATH=$pm2_dir:/usr/local/bin:/usr/bin:/bin PM2_HOME=$home $pm2_bin start $ids")
+      ok "PM2 de $dono parado (ids $ids)"
+      # Sem desativar o boot, o pm2 resurrect religaria os processos no próximo boot
+      unidade="pm2-$dono.service"
+      if systemctl is-enabled --quiet "$unidade" 2>/dev/null; then
+        sudo systemctl disable "$unidade" >/dev/null 2>&1 || true
+        REVERTER+=("sudo systemctl enable $unidade")
+        ok "$unidade desabilitada: o PM2 de $dono não religa os processos no boot"
+      fi
+    else
+      nota "PM2 de $dono continua rodando os processos $ids"
+    fi
+  done
+  if [ "$ATUAL_NGINX_HOST" = 1 ]; then
+    if confirmar "Parar e desabilitar o Nginx da máquina? (/etc/nginx é mantido)"; then
+      sudo systemctl disable --now nginx >/dev/null 2>&1
+      REVERTER+=("sudo systemctl enable --now nginx")
+      ok "Nginx da máquina parado e desabilitado"
+    fi
+  fi
+  if [ "$ATUAL_NGINX_SOLTO" = 1 ]; then
+    if confirmar "Parar o nginx fora do systemd (sem apagar a configuração)?"; then
+      # Só pelo nginx da máquina: um pkill acertaria também o nginx dos contêineres
+      if command -v nginx >/dev/null && sudo nginx -s quit 2>/dev/null; then
+        sleep 2
+        REVERTER+=("sudo nginx")
+        ok "Processo nginx parado"
+      fi
+    fi
+  fi
+  for c in "${ATUAL_CONTEINERES[@]}"; do
+    if confirmar "Parar o contêiner $c? (ele e a configuração são mantidos)"; then
+      # Sem isto, a política de restart o religaria com o Docker ou no boot
+      "${DOCKER[@]}" update --restart=no "$c" >/dev/null
+      "${DOCKER[@]}" stop "$c" >/dev/null
+      REVERTER+=("${DOCKER[*]} update --restart=unless-stopped $c && ${DOCKER[*]} start $c")
+      ok "Contêiner $c parado"
+    fi
+  done
+  [ -z "$(portas_ocupadas)" ] || return 1
+  for c in "${ATUAL_CONTEINERES[@]}"; do
+    [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" != true ] || return 1
+  done
+}
+
+# Religa o sistema anterior: tira o Nginx deste sistema das portas e desfaz as paradas, de trás
+# para a frente
+religar_sistema_atual() {
+  local i d
+  [ "${#REVERTER[@]}" -gt 0 ] || return 0
+  d="$("${DOCKER[@]}" inspect nginx -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+  if [[ -n "$d" && "$d" == "$BASE"* ]]; then "${DOCKER[@]}" rm -f nginx >/dev/null; fi
+  for ((i = ${#REVERTER[@]} - 1; i >= 0; i--)); do
+    if eval "${REVERTER[$i]}" >/dev/null 2>&1; then
+      ok "Religado: ${REVERTER[$i]}"
+    else
+      aviso "Não consegui religar, rode à mão: ${REVERTER[$i]}"
+    fi
+  done
+  REVERTER=()
+}
+
+# Compila as imagens que o deploy.sh vai usar (a próxima cor e a migração) com o sistema atual no
+# ar. O deploy.sh compila de novo, mas tudo vem do cache: a troca em si leva segundos.
+compilar_imagens() {
+  local dir="$1" amb="$2" sis prefixo projeto cor log
+  sis="$(grep -m1 -oE '^SISTEMA=[^[:space:]]+' "$dir/deploy.sh" 2>/dev/null | cut -d= -f2 | tr -d "\"'" || true)"
+  sis="${sis:-$SISTEMA}"
+  if [ "$amb" = "$PROD_NOME" ]; then prefixo="${sis}_" projeto="$sis"; else prefixo="${sis}_hml_" projeto="$sis-hml"; fi
+  case "$(grep -oE '(blue|green)_app:' "/opt/$sis/nginx/$amb.inc" 2>/dev/null | head -1 || true)" in
+    blue_app:) cor=green ;;
+    *) cor=blue ;;
+  esac
+  log="$BASE/build-$amb.log"
+  # sg aplica o grupo docker sem precisar sair da sessão
+  if sg docker -c "cd '$dir' && APP_PREFIX='$prefixo' docker compose -p '$projeto-$cor' -f 'compose.$cor.yml' build" >"$log" 2>&1 \
+    && { [ ! -f "$dir/compose.migrate.yml" ] \
+      || sg docker -c "cd '$dir' && docker compose -p '$projeto-migrate' -f compose.migrate.yml build" >>"$log" 2>&1; }; then
+    rm -f "$log"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Instalação atual (deploy antigo) de um repositório na VM
 
 # Pastas com .git cujo remoto é DONO/REPO, em /home, /root, /var/www, /srv e /opt (fora de
@@ -395,6 +594,34 @@ volumes_do_compose() {
 
 # Chaves do .env antigo que não vão para a homologação: banco e endereço do próprio ambiente
 CHAVES_SO_PRODUCAO='^(DATABASE_URL|DIRECT_URL|SHADOW_DATABASE_URL|POSTGRES_[A-Z_]*|DB_[A-Z_]*|PG[A-Z_]*|NEXTAUTH_URL|AUTH_URL|APP_URL|BASE_URL|SITE_URL|PUBLIC_URL|NEXT_PUBLIC_[A-Z_]*URL)$'
+# Endereço do próprio ambiente: preenchidas sozinhas (https://domínio, ou http://IP:porta)
+CHAVES_URL_PROPRIA='^(NEXTAUTH_URL|AUTH_URL|APP_URL|BASE_URL|SITE_URL|PUBLIC_URL|NEXT_PUBLIC_URL|NEXT_PUBLIC_(APP|SITE|BASE)_URL)$'
+# Pedidas sem eco na tela: a URL do banco leva a senha
+CHAVES_OCULTAS='SECRET|PASSWORD|SENHA|TOKEN|_KEY|^DATABASE_URL$|^DIRECT_URL$|^SHADOW_DATABASE_URL$|^REDIS_URL$|_DSN$|_URI$'
+
+# Endereço público de um ambiente, lido do nginx/default.conf do repositório: o domínio com
+# https (atrás do proxy da prefeitura), ou o IP da VM com a porta de homologação
+url_do_ambiente() {
+  local dest="$1" amb="$2" conf bloco nomes porta n
+  conf="$dest/nginx/default.conf"
+  [ -f "$conf" ] || conf="$RAIZ/$PROD_NOME/nginx/default.conf"
+  [ -f "$conf" ] || return 0
+  if [ "$amb" = "$PROD_NOME" ]; then bloco='^# Produção'; else bloco='^# Homologação'; fi
+  nomes="$(awk -v b="$bloco" '$0 ~ b { f = 1 } f && /^[[:space:]]*server_name/ { $1 = ""; print; exit }' "$conf" | tr -d ';')"
+  for n in $nomes; do
+    [ "$n" != _ ] || continue
+    if [[ "$n" =~ ^[0-9.]+$ ]]; then continue; fi
+    echo "https://$n"
+    return 0
+  done
+  if [ "$amb" = "$PROD_NOME" ]; then
+    for n in $nomes; do [[ "$n" =~ ^[0-9.]+$ ]] && { echo "http://$n"; return 0; }; done
+    return 0
+  fi
+  porta="$(awk '/^# Homologação/ { f = 1 } f && /listen[[:space:]]+[0-9]+[[:space:]]+default_server/ { print $2; exit }' "$conf")"
+  echo "http://$(hostname -I | awk '{print $1}'):${porta:-3001}"
+}
+
 # Chaves de banco: localhost vira host.docker.internal (o banco fica fora do contêiner)
 CHAVES_DE_BANCO='^(DATABASE_URL|DIRECT_URL|SHADOW_DATABASE_URL|REDIS_URL|POSTGRES_HOST|DB_HOST|PGHOST)$'
 
@@ -564,33 +791,11 @@ if [ "$INTERATIVO" = 1 ]; then
       "$hml_sugerido|criar $hml_sugerido (banco e usuário novos, vazios)" \
       "|não criar (já existe ou fica em outro servidor)"
   fi
-  if [ -d /etc/postgresql ] && [ "${#PG_ACESSOS[@]}" -eq 0 ] && [ "$RETOMADO" = 0 ]; then
-    bancos="$(sudo -u postgres psql -tAc "SELECT datname || '|' || pg_get_userbyid(datdba) FROM pg_database
-      WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1" 2>/dev/null || true)"
-    if [ -n "$bancos" ]; then
-      # Sem os de homologação; já marcados os que têm o nome do sistema (superflow-db, superflow_db...)
-      opcoes=() liberar=() marcados="" i=1
-      raiz_nome="$(tr '_-' '..' <<<"$SISTEMA")"
-      while IFS='|' read -r db dono; do
-        [[ "$db" == *_hml || "$db" == "$PG_HML" ]] && continue
-        opcoes+=("$db|$db (dono: $dono)")
-        [[ "$(tr '_-' '..' <<<"$db")" == *"$raiz_nome"* ]] && marcados+="$i "
-        i=$((i + 1))
-      done <<<"$bancos"
-      [ "${#opcoes[@]}" -eq 0 ] || escolher_varios liberar \
-        "Bancos de produção que os contêineres vão acessar (libera no pg_hba.conf)" "${marcados% }" "${opcoes[@]}"
-      for db in "${liberar[@]}"; do
-        dono="$(grep -m1 "^$db|" <<<"$bancos" | cut -d'|' -f2)"
-        perguntar usuario "Usuário que acessa $db" "$dono" '^[A-Za-z0-9_-]+$'
-        PG_ACESSOS+=("$db:$usuario")
-      done
-    fi
-  fi
 
   if [ -z "$DEPLOY" ]; then
     escolher DEPLOY "Ao final" 1 \
-      "0|só preparar a VM (o deploy fica para depois, ou para o push)" \
-      "1|preparar e fazer o primeiro deploy, homologação primeiro (se não houver pendências)"
+      "0|só preparar a VM (o sistema atual, se houver, continua no ar)" \
+      "1|preparar e fazer o primeiro deploy: compila as imagens, só então para o sistema atual e publica"
   fi
 
   # Comando equivalente, para repetir sem perguntas (o GH_TOKEN nunca entra aqui)
@@ -646,134 +851,14 @@ if docker info >/dev/null 2>&1; then DOCKER=(docker); else DOCKER=(sudo docker);
 ok "Rede docker web (compartilhada pelos sistemas da VM)"
 
 # ---------------------------------------------------------------------------
-etapa "PM2"
-# Sistemas que já rodam pelo PM2 são parados e deixam de subir no boot, mas a lista de
-# processos (dump.pm2) e os arquivos de cada app ficam: dá para voltar com pm2 resurrect.
-pm2_achou=0
-
-# 1. Daemons do PM2 em execução, de qualquer usuário
-for pid in $(pgrep -f 'PM2 v[0-9.]+: God Daemon' || true); do
-  pm2_achou=1
-  dono_pm2="$(ps -o user= -p "$pid" | tr -d ' ')"
-  pm2_home="$(tr '\0' ' ' < "/proc/$pid/cmdline" | sed -nE 's/.*\((.*)\).*/\1/p')"
-  # O pm2 fica ao lado do node que roda o daemon (instalação global ou nvm)
-  node_bin="$(sudo readlink -f "/proc/$pid/exe")"
-  pm2_bin="$(dirname "$node_bin")/pm2"
-  [ -x "$pm2_bin" ] || pm2_bin="$(command -v pm2 || true)"
-  if [ -z "$pm2_bin" ]; then
-    aviso "PM2 de $dono_pm2 ($pm2_home) em execução, mas não achei o executável pm2: rode pm2 stop all e pm2 unstartup à mão"
-    continue
-  fi
-  pm2_de() { sudo -u "$dono_pm2" env PATH="$(dirname "$node_bin"):/usr/local/bin:/usr/bin:/bin" PM2_HOME="$pm2_home" "$pm2_bin" "$@"; }
-
-  # || true: sem processo online, o grep sai com 1 e o pipefail derrubaria o script
-  online="$( (pm2_de jlist 2>/dev/null || true) | { grep -o '"status":"online"' || true; } | wc -l)"
-  if [ "$online" -eq 0 ]; then
-    ok "PM2 de $dono_pm2: nenhum processo rodando"
-    continue
-  fi
-  echo "    PM2 de $dono_pm2 ($pm2_home) com $online processo(s) rodando:"
-  pm2_de ls --no-color 2>/dev/null | sed 's/^/      /'
-  if confirmar "Parar todos os processos do PM2 de $dono_pm2? (nada é apagado)"; then
-    # Sem pm2 save: o dump.pm2 continua com a lista anterior, para o pm2 resurrect
-    pm2_de stop all >/dev/null
-    ok "PM2 de $dono_pm2 parado; para voltar: pm2 resurrect"
-  else
-    aviso "PM2 de $dono_pm2 continua rodando $online processo(s)"
-  fi
-done
-
-# 2. Inicialização automática do PM2 (unidades pm2-<usuário>.service)
-for unidade in $(systemctl list-unit-files --type=service --no-legend 'pm2-*.service' 2>/dev/null | awk '{print $1}'); do
-  pm2_achou=1
-  dono_pm2="$(systemctl show -p User --value "$unidade")"
-  dono_pm2="${dono_pm2:-root}"
-  casa="$(getent passwd "$dono_pm2" | cut -d: -f6)"
-  pm2_bin="$(systemctl show -p ExecStart --value "$unidade" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)"
-  pm2_path="$(systemctl show -p Environment --value "$unidade" | tr ' ' '\n' | sed -n 's/^PATH=//p')"
-  if confirmar "Desativar a inicialização automática do PM2 de $dono_pm2 ($unidade)?"; then
-    if [ -x "$pm2_bin" ] && sudo env PATH="${pm2_path:-/usr/local/bin:/usr/bin:/bin}" "$pm2_bin" unstartup systemd -u "$dono_pm2" --hp "$casa" >/dev/null 2>&1; then
-      ok "pm2 unstartup feito para $dono_pm2; para voltar: pm2 startup"
-    else
-      # Mesmo efeito do unstartup, sem depender do executável
-      sudo systemctl disable "$unidade" >/dev/null 2>&1 || true
-      ok "$unidade desabilitada (sem o pm2 unstartup); para voltar: sudo systemctl enable $unidade"
-    fi
-  else
-    aviso "PM2 de $dono_pm2 continua subindo no boot ($unidade)"
-  fi
-done
-
-[ "$pm2_achou" = 1 ] || ok "PM2 não está em uso"
-
-# ---------------------------------------------------------------------------
-etapa "Portas 80 e 3001"
-# Todo Nginx que ocupar as portas é desligado, nunca apagado: a configuração fica onde está
-# e ele pode ser religado. Antes, pergunta, porque tira do ar o que ele atende.
-portas_ocupadas() { sudo ss -ltnpH '( sport = :80 or sport = :3001 )' | grep -v docker-proxy || true; }
-
-# 1. Nginx da máquina, gerenciado pelo systemd
-if systemctl cat nginx.service >/dev/null 2>&1; then
-  if systemctl is-active --quiet nginx; then
-    echo "    O Nginx instalado na máquina está ativo e ocupa a porta 80."
-    if confirmar "Parar e desabilitar o Nginx da máquina? (/etc/nginx é mantido)"; then
-      sudo systemctl disable --now nginx
-      ok "Nginx da máquina parado e desabilitado; para voltar: sudo systemctl enable --now nginx"
-    else
-      aviso "Nginx da máquina continua ligado: o Nginx em contêiner não vai subir"
-    fi
-  elif systemctl is-enabled --quiet nginx 2>/dev/null; then
-    # Parado, mas voltaria no próximo boot e tomaria a porta 80 antes do Docker
-    sudo systemctl disable nginx
-    ok "Nginx da máquina já estava parado; desabilitado para não voltar no boot"
-  fi
-fi
-
-# 2. Nginx da máquina iniciado fora do systemd (o do systemd mantido acima não conta)
-if ! systemctl is-active --quiet nginx 2>/dev/null && portas_ocupadas | grep -q '"nginx"'; then
-  if confirmar "Há um processo nginx fora do systemd nas portas 80/3001. Pará-lo (sem apagar a configuração)?"; then
-    # Só pelo nginx da máquina: um pkill acertaria também o nginx dos contêineres
-    if command -v nginx >/dev/null && sudo nginx -s quit 2>/dev/null; then
-      sleep 2
-      ok "Processo nginx parado"
-    else
-      aviso "Não consegui parar o nginx fora do systemd: pare-o à mão (sem apagar /etc/nginx)"
-    fi
-  fi
-fi
-
-# 3. Contêineres de outros sistemas publicando as portas
-for c in $("${DOCKER[@]}" ps --format '{{.Names}}'); do
-  portas="$("${DOCKER[@]}" port "$c" 2>/dev/null | grep -E ':(80|3001)$' || true)"
-  [ -n "$portas" ] || continue
-  dono="$("${DOCKER[@]}" inspect "$c" -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
-  [[ -n "$dono" && "$dono" == "$BASE"* ]] && { ok "Contêiner $c já é deste sistema"; continue; }
-  imagem="$("${DOCKER[@]}" inspect "$c" -f '{{.Config.Image}}')"
-  echo "    O contêiner $c ($imagem, de ${dono:-origem desconhecida}) ocupa a porta 80 ou 3001."
-  if confirmar "Parar o contêiner $c? (ele e a configuração são mantidos)"; then
-    # Sem isto, a política de restart o religaria com o Docker ou no boot
-    "${DOCKER[@]}" update --restart=no "$c" >/dev/null
-    "${DOCKER[@]}" stop "$c" >/dev/null
-    ok "Contêiner $c parado; para voltar: docker update --restart=unless-stopped $c && docker start $c"
-  else
-    aviso "Contêiner $c continua nas portas 80/3001: o Nginx deste sistema não vai subir"
-  fi
-done
-
-# Um contêiner parado chamado nginx impediria o deploy de criar o deste sistema com o mesmo nome
-if "${DOCKER[@]}" inspect nginx >/dev/null 2>&1; then
-  dono="$("${DOCKER[@]}" inspect nginx -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
-  if [[ "$dono" != "$BASE"* ]] && [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' nginx)" != true ]; then
-    "${DOCKER[@]}" rename nginx "nginx-parado-$(date +%Y%m%d)"
-    ok "Contêiner nginx parado de ${dono:-outro sistema} renomeado para nginx-parado-$(date +%Y%m%d) (não foi apagado)"
-  fi
-fi
-
-ocupadas="$(portas_ocupadas)"
-if [ -n "$ocupadas" ]; then
-  aviso "Porta 80 ou 3001 ainda ocupada: $(echo "$ocupadas" | awk '{print $4, $6}' | tr '\n' ' ')"
+etapa "Sistema atual"
+detectar_sistema_atual
+if ! tem_sistema_atual; then
+  ok "Portas 80 e 3001 livres e nenhum processo no PM2"
+elif [ "$DEPLOY" = 1 ]; then
+  ok "Fica no ar até o primeiro deploy, no fim desta execução: as imagens novas são compiladas antes"
 else
-  ok "Portas 80 e 3001 livres para o Nginx deste sistema"
+  nota "O sistema atual continua no ar. O primeiro deploy precisa ser por aqui (rode de novo e escolha fazer o deploy): pelo push, o Nginx novo não subiria com a porta 80 ocupada"
 fi
 
 # ---------------------------------------------------------------------------
@@ -899,55 +984,22 @@ for spec in "${REPOS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-if [ -n "$PG_HML" ] || [ "${#PG_ACESSOS[@]}" -gt 0 ]; then
-  etapa "PostgreSQL da máquina"
-  PG_DIR="$(ls -d /etc/postgresql/*/main 2>/dev/null | sort -V | tail -1 || true)"
-  [ -n "$PG_DIR" ] || falha "PostgreSQL não encontrado em /etc/postgresql"
-  psql_pg() { sudo -u postgres psql -v ON_ERROR_STOP=1 -tAc "$1"; }
-  WEB_SUBNET="$("${DOCKER[@]}" network inspect web -f '{{(index .IPAM.Config 0).Subnet}}')"
-  DOCKER0_IP="$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)"
-
-  if [ -n "$PG_HML" ]; then
-    [[ "$PG_HML" =~ ^[a-z0-9_]+$ ]] || falha "--pg-hml aceita só minúsculas, números e _"
-    PG_ACESSOS+=("$PG_HML:$PG_HML")
-    if [ "$(psql_pg "SELECT 1 FROM pg_roles WHERE rolname = '$PG_HML'")" != 1 ]; then
-      # Hexadecimal: sem @ : / $, que quebrariam a URL ou o Compose
-      senha="$(openssl rand -hex 24)"
-      psql_pg "CREATE ROLE $PG_HML LOGIN PASSWORD '$senha'"
-      psql_pg "CREATE DATABASE $PG_HML OWNER $PG_HML"
-      PG_URL="postgresql://$PG_HML:$senha@host.docker.internal:5432/$PG_HML"
-      ok "Banco e usuário $PG_HML criados, vazios (a migração do deploy cria as tabelas)"
-    else
-      ok "Usuário $PG_HML já existe"
-    fi
-  fi
-
-  # Escuta também no docker0, para onde aponta o host.docker.internal
-  listen="$(psql_pg "SHOW listen_addresses")"
-  reiniciar=0
-  if [ "$listen" != "*" ] && [[ ",$listen," != *",$DOCKER0_IP,"* ]]; then
-    sudo grep -qE "^\s*include_dir\s*=\s*'conf.d'" "$PG_DIR/postgresql.conf" \
-      || falha "$PG_DIR/postgresql.conf sem include_dir 'conf.d': inclua $DOCKER0_IP em listen_addresses à mão"
-    sudo mkdir -p "$PG_DIR/conf.d"
-    echo "listen_addresses = '$listen,$DOCKER0_IP'" | sudo tee "$PG_DIR/conf.d/docker.conf" >/dev/null
-    reiniciar=1
-    ok "listen_addresses: $listen,$DOCKER0_IP"
+# Banco de homologação antes do .env, para o endereço dele já entrar no .env de homologação
+psql_pg() { sudo -u postgres psql -v ON_ERROR_STOP=1 -tAc "$1"; }
+if [ -n "$PG_HML" ]; then
+  etapa "Banco de homologação"
+  [ -d /etc/postgresql ] || falha "--pg-hml: PostgreSQL não encontrado em /etc/postgresql"
+  [[ "$PG_HML" =~ ^[a-z0-9_]+$ ]] || falha "--pg-hml aceita só minúsculas, números e _"
+  if [ "$(psql_pg "SELECT 1 FROM pg_roles WHERE rolname = '$PG_HML'")" != 1 ]; then
+    # Hexadecimal: sem @ : / $, que quebrariam a URL ou o Compose
+    senha="$(openssl rand -hex 24)"
+    psql_pg "CREATE ROLE $PG_HML LOGIN PASSWORD '$senha'"
+    psql_pg "CREATE DATABASE $PG_HML OWNER $PG_HML"
+    PG_URL="postgresql://$PG_HML:$senha@host.docker.internal:5432/$PG_HML"
+    ok "Banco e usuário $PG_HML criados, vazios (a migração do deploy cria as tabelas)"
   else
-    ok "listen_addresses já aceita o docker0 ($listen)"
+    ok "Usuário $PG_HML já existe"
   fi
-
-  for acesso in "${PG_ACESSOS[@]}"; do
-    db="${acesso%%:*}" user="${acesso#*:}"
-    if sudo grep -qE "^host\s+$db\s+$user\s+$WEB_SUBNET\s" "$PG_DIR/pg_hba.conf"; then
-      ok "pg_hba.conf já libera $db/$user para $WEB_SUBNET"
-    else
-      echo "host  $db  $user  $WEB_SUBNET  scram-sha-256" | sudo tee -a "$PG_DIR/pg_hba.conf" >/dev/null
-      ok "pg_hba.conf: $db/$user liberado para $WEB_SUBNET"
-    fi
-  done
-
-  if [ "$reiniciar" = 1 ]; then sudo systemctl restart postgresql; else sudo systemctl reload postgresql; fi
-  ok "PostgreSQL recarregado"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1113,18 @@ for spec in "${REPOS[@]}"; do
       done
     fi
 
+    # Endereço do próprio ambiente (NEXTAUTH_URL e afins), onde ainda está como no exemplo
+    url_amb="$(url_do_ambiente "$dest" "$amb")"
+    if [ -n "$url_amb" ] && [ -n "$exemplo" ]; then
+      while IFS= read -r chave; do
+        atual="$(get_env "$env" "$chave")"
+        if [ -z "$atual" ] || [ "$atual" = "$(get_env "$exemplo" "$chave")" ]; then
+          set_env "$env" "$chave" "$url_amb"
+          ok "$amb: $chave = $url_amb"
+        fi
+      done < <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$exemplo" | tr -d = | grep -E "$CHAVES_URL_PROPRIA" || true)
+    fi
+
     # O que ainda está igual ao exemplo precisa ser revisto à mão
     if [ -n "$exemplo" ]; then
       iguais=()
@@ -1074,8 +1138,8 @@ for spec in "${REPOS[@]}"; do
         echo "    $amb: valores ainda iguais ao exemplo (Enter mantém)"
         restantes=()
         for chave in "${iguais[@]}"; do
-          if [[ "$chave" =~ SECRET|PASSWORD|SENHA|TOKEN|_KEY ]]; then
-            perguntar_segredo valor "$amb: $chave"
+          if [[ "$chave" =~ $CHAVES_OCULTAS ]]; then
+            perguntar_segredo valor "$amb: $chave (exemplo: $(get_env "$exemplo" "$chave"))"
           else
             perguntar valor "$amb: $chave (exemplo: $(get_env "$exemplo" "$chave"))" "" '^.*$'
           fi
@@ -1088,6 +1152,11 @@ for spec in "${REPOS[@]}"; do
             valor="${valor/@localhost/@host.docker.internal}"
             valor="${valor/@127.0.0.1/@host.docker.internal}"
             ok "$amb: $chave com localhost trocado por host.docker.internal"
+          fi
+          # URL sem esquema (ex.: isencao.saoluis.ma.gov.br): https para domínio, http para IP
+          if [[ "$chave" == *_URL && "$valor" != *://* && "$valor" =~ ^[A-Za-z0-9.-]+\.[A-Za-z0-9-]+(:[0-9]+)?(/.*)?$ ]]; then
+            if [[ "$valor" =~ ^[0-9.]+(:|/|$) ]]; then valor="http://$valor"; else valor="https://$valor"; fi
+            ok "$amb: $chave sem http(s)://, gravado como $valor"
           fi
           # Aspas simples: o Compose não interpreta espaço, # nem $ dentro delas
           if [[ "$valor" =~ [[:space:]#\$] ]] && [[ ! "$valor" =~ ^[\"\'] ]] && [[ "$valor" != *"'"* ]]; then
@@ -1108,6 +1177,74 @@ if [ -n "$PG_URL" ] && [ "$PG_URL_USADA" = 0 ]; then
 elif [ "$PG_URL_USADA" = 1 ] && [ -f "$BASE/$PG_HML.url" ]; then
   # Tem a senha do banco: não fica para trás depois de usado
   rm -f "$BASE/$PG_HML.url"
+fi
+
+# ---------------------------------------------------------------------------
+# Acesso dos contêineres ao PostgreSQL da máquina: os bancos saem do DATABASE_URL/DIRECT_URL de
+# cada .env (os que apontam para host.docker.internal), mais os de --pg-acesso
+RE_URL_PG='^postgres(ql)?://([^:@/]+)(:[^@]*)?@(host\.docker\.internal|172\.17\.0\.1)(:[0-9]+)?/([^?]+)'
+if [ -d /etc/postgresql ]; then
+  etapa "Acesso ao PostgreSQL da máquina"
+  PG_DIR="$(ls -d /etc/postgresql/*/main 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "$PG_DIR" ] || falha "PostgreSQL não encontrado em /etc/postgresql"
+  WEB_SUBNET="$("${DOCKER[@]}" network inspect web -f '{{(index .IPAM.Config 0).Subnet}}')"
+  DOCKER0_IP="$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)"
+
+  acessos=("${PG_ACESSOS[@]}")
+  for spec in "${REPOS[@]}"; do
+    ler_repo "$spec"
+    for amb in "$PROD_NOME" "$HML_NOME"; do
+      env="$RAIZ/$amb/.env"
+      [ -f "$env" ] || continue
+      for chave in DATABASE_URL DIRECT_URL; do
+        valor="$(get_env "$env" "$chave" | tr -d "\"'")"
+        if [[ "$valor" =~ $RE_URL_PG ]] && [[ "${BASH_REMATCH[2]}" != USUARIO ]]; then
+          acessos+=("${BASH_REMATCH[6]}:${BASH_REMATCH[2]}")
+        fi
+      done
+    done
+  done
+  mapfile -t acessos < <(printf '%s\n' "${acessos[@]}" | grep -v '^$' | sort -u)
+
+  if [ "${#acessos[@]}" -eq 0 ]; then
+    ok "Nenhum .env aponta para o PostgreSQL da máquina (host.docker.internal)"
+  else
+    # Escuta também no docker0, para onde aponta o host.docker.internal
+    listen="$(psql_pg "SHOW listen_addresses")"
+    reiniciar=0
+    if [ "$listen" != "*" ] && [[ ",$listen," != *",$DOCKER0_IP,"* ]]; then
+      sudo grep -qE "^\s*include_dir\s*=\s*'conf.d'" "$PG_DIR/postgresql.conf" \
+        || falha "$PG_DIR/postgresql.conf sem include_dir 'conf.d': inclua $DOCKER0_IP em listen_addresses à mão"
+      sudo mkdir -p "$PG_DIR/conf.d"
+      echo "listen_addresses = '$listen,$DOCKER0_IP'" | sudo tee "$PG_DIR/conf.d/docker.conf" >/dev/null
+      reiniciar=1
+      ok "listen_addresses: $listen,$DOCKER0_IP"
+    else
+      ok "listen_addresses já aceita o docker0 ($listen)"
+    fi
+
+    for acesso in "${acessos[@]}"; do
+      db="${acesso%%:*}" user="${acesso#*:}"
+      if sudo grep -qE "^host\s+$db\s+$user\s+$WEB_SUBNET\s" "$PG_DIR/pg_hba.conf"; then
+        ok "pg_hba.conf já libera $db/$user para $WEB_SUBNET"
+      else
+        echo "host  $db  $user  $WEB_SUBNET  scram-sha-256" | sudo tee -a "$PG_DIR/pg_hba.conf" >/dev/null
+        ok "pg_hba.conf: $db/$user liberado para $WEB_SUBNET"
+      fi
+    done
+
+    if [ "$reiniciar" = 1 ]; then sudo systemctl restart postgresql; else sudo systemctl reload postgresql; fi
+    ok "PostgreSQL recarregado"
+  fi
+
+  # Segurança: não impede o deploy, mas aparece no resumo
+  while IFS= read -r linha; do
+    nota "pg_hba.conf aceita conexão sem senha (trust) de fora da máquina: \"$linha\". Troque por scram-sha-256 ou restrinja o endereço"
+  done < <(sudo grep -hE '^\s*host' "$PG_DIR/pg_hba.conf" | awk '$NF == "trust" && $4 != "127.0.0.1/32" && $4 != "::1/128" && $4 != "localhost" && $4 != "samehost"' | tr -s ' \t' ' ')
+  listen="$(psql_pg "SHOW listen_addresses")"
+  if [[ "$listen" == "*" || ",$listen," == *",0.0.0.0,"* ]] && ! sudo ufw status 2>/dev/null | grep -q 'Status: active'; then
+    nota "PostgreSQL ouve em todas as interfaces (listen_addresses = '$listen') e o firewall está desligado: a porta 5432 fica aberta para a rede"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1206,19 +1343,57 @@ if [ "$DEPLOY" = 1 ]; then
   if [ "${#PENDENCIAS[@]}" -gt 0 ]; then
     aviso "Deploy não executado: resolva as pendências antes"
   else
-    # Homologação primeiro: se ela falhar, produção não é publicada
+    # 1. Imagens compiladas com o sistema atual ainda no ar
+    seguir=1
     for amb in "$HML_NOME" "$PROD_NOME"; do
       for spec in "${REPOS[@]}"; do
         ler_repo "$spec"
-        # sg aplica o grupo docker sem precisar sair da sessão
-        if sg docker -c "cd '$RAIZ/$amb' && bash deploy.sh '$amb'"; then
-          ok "$SLUG: deploy de $amb concluído"
+        printf '    %s%s%s Compilando %s (%s); pode levar alguns minutos...\n' "$CIANO" "$I_INFO" "$RESET" "$SLUG" "$amb"
+        if compilar_imagens "$RAIZ/$amb" "$amb"; then
+          ok "$SLUG ($amb): imagens compiladas"
         else
-          aviso "$SLUG: deploy de $amb falhou (veja a saída acima); os seguintes não foram executados"
+          aviso "$SLUG ($amb): a compilação falhou, nada foi parado. Últimas linhas de $BASE/build-$amb.log:"
+          tail -15 "$BASE/build-$amb.log" | sed 's/^/        /'
+          seguir=0
           break 2
         fi
       done
     done
+
+    # 2. O sistema atual sai do ar só agora, com tudo pronto
+    if [ "$seguir" = 1 ] && tem_sistema_atual; then
+      printf '    %s%s%s Imagens prontas. O sistema atual sai do ar até o deploy terminar (cerca de 1 minuto):\n' "$CIANO" "$I_INFO" "$RESET"
+      if ! parar_sistema_atual; then
+        aviso "Portas 80/3001 ainda ocupadas: deploy não executado"
+        religar_sistema_atual
+        seguir=0
+      fi
+    fi
+
+    # 3. Deploy, homologação primeiro; se falhar, o sistema anterior é religado
+    if [ "$seguir" = 1 ]; then
+      for amb in "$HML_NOME" "$PROD_NOME"; do
+        for spec in "${REPOS[@]}"; do
+          ler_repo "$spec"
+          if sg docker -c "cd '$RAIZ/$amb' && bash deploy.sh '$amb'"; then
+            ok "$SLUG: deploy de $amb concluído"
+          else
+            aviso "$SLUG: deploy de $amb falhou (veja a saída acima); os seguintes não foram executados"
+            if [ "${#REVERTER[@]}" -gt 0 ]; then
+              printf '    %s%s%s Religando o sistema anterior:\n' "$CIANO" "$I_INFO" "$RESET"
+              religar_sistema_atual
+            fi
+            seguir=0
+            break 2
+          fi
+        done
+      done
+      if [ "$seguir" = 1 ] && [ "${#REVERTER[@]}" -gt 0 ]; then
+        printf '    %s%s%s Para voltar ao sistema anterior, na ordem:\n' "$CIANO" "$I_INFO" "$RESET"
+        printf '        %s rm -f nginx\n' "${DOCKER[*]}"
+        for ((i = ${#REVERTER[@]} - 1; i >= 0; i--)); do printf '        %s\n' "${REVERTER[$i]}"; done
+      fi
+    fi
   fi
 fi
 
@@ -1239,10 +1414,14 @@ for spec in "${REPOS[@]}"; do
 done
 if [ "${#PENDENCIAS[@]}" -eq 0 ]; then
   ok "Nenhuma pendência"
-  [ "$DEPLOY" = 1 ] || printf '    %s%s%s Próximo passo: rode de novo com --deploy, ou faça push nas branches\n' "$CIANO" "$I_INFO" "$RESET"
+  [ "$DEPLOY" = 1 ] || printf '    %s%s%s Próximo passo: rode de novo e escolha fazer o deploy (com sistema atual no ar, o push não basta)\n' "$CIANO" "$I_INFO" "$RESET"
 else
   printf '    %s%s %d pendência(s):%s\n' "$AMARELO$NEGRITO" "$I_AVISO" "${#PENDENCIAS[@]}" "$RESET"
   for p in "${PENDENCIAS[@]}"; do printf '      %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$p"; done
+fi
+if [ "${#NOTAS[@]}" -gt 0 ]; then
+  printf '    %s%s Atenção (não impede o deploy):%s\n' "$AMARELO$NEGRITO" "$I_AVISO" "$RESET"
+  for p in "${NOTAS[@]}"; do printf '      %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$p"; done
 fi
 [ "${DOCKER[0]}" = sudo ] && printf '    %s%s%s Saia e entre de novo na sessão para usar docker sem sudo.\n' "$CIANO" "$I_INFO" "$RESET"
 if [ "${#PENDENCIAS[@]}" -gt 0 ]; then
