@@ -6,9 +6,10 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Parâmetros
-FORGE=github GIT_HOST=github.com
-SISTEMA="" PROD_NOME=production PROD_BRANCH=main HML_NOME=developer HML_BRANCH=dev
-SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY=0 SIM=0
+FORGE=github GIT_HOST=github.com FORGE_DEFINIDO=0
+# Branches e --deploy vazios até o fim da leitura: o modo interativo só pergunta o que não veio
+SISTEMA="" PROD_NOME=production PROD_BRANCH="" HML_NOME=developer HML_BRANCH=""
+SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY="" SIM=0 INTERATIVO=auto
 REPOS=() PG_ACESSOS=() ENV_TODOS=() ENV_PROD=() ENV_HML=()
 
 VERSAO=2.0.0
@@ -57,6 +58,14 @@ Opções:
   --sem-clone             não clona (o workflow do sistema cria as pastas sozinho)
   --deploy                roda deploy.sh de cada pasta no final, homologação primeiro
   --sim                   não pergunta antes de parar o PM2 ou o Nginx que ocupa as portas 80/3001
+  -i, --interativo        pergunta o que faltar, mesmo com --sistema e --repo informados
+  --nao-interativo        nunca pergunta (CI, ssh sem terminal): falta de opção é erro
+
+Modo interativo: sem --sistema ou --repo e com terminal, o script pergunta o que faltar,
+com listas de escolha para branches, bancos do PostgreSQL, segredos e valores do .env.
+No fim mostra o comando equivalente, para repetir sem perguntas:
+
+  bash setup-host.sh
 
 Acesso ao GitHub (cadastrar deploy keys e registrar runners; não vale para o GitLab):
   GH_TOKEN   token com escopo repo e admin nos repositórios. Na sua máquina: gh auth token.
@@ -81,7 +90,7 @@ while [ $# -gt 0 ]; do
     --pg-hml) PG_HML="$2"; shift 2 ;;
     --pg-acesso) PG_ACESSOS+=("$2"); shift 2 ;;
     --gitlab)
-      FORGE=gitlab
+      FORGE=gitlab FORGE_DEFINIDO=1
       GIT_HOST="${2#*://}"
       GIT_HOST="${GIT_HOST%%/*}"
       shift 2
@@ -89,17 +98,27 @@ while [ $# -gt 0 ]; do
     --sem-clone) CLONAR=0; shift ;;
     --deploy) DEPLOY=1; shift ;;
     --sim) SIM=1; shift ;;
+    -i|--interativo) INTERATIVO=1; shift ;;
+    --nao-interativo) INTERATIVO=0; shift ;;
     -h|--help) uso ;;
     --versao|--version) echo "setup-host.sh $VERSAO"; exit 0 ;;
     *) echo "Opção desconhecida: $1" >&2; uso 1 ;;
   esac
 done
 
-[ -n "$SISTEMA" ] || { echo "Falta --sistema" >&2; uso 1; }
-[ "${#REPOS[@]}" -gt 0 ] || { echo "Falta ao menos um --repo" >&2; uso 1; }
-[[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || { echo "--sistema aceita só minúsculas, números, _ e -" >&2; exit 1; }
+# Faltou --sistema ou --repo e há terminal: pergunta em vez de parar (-i força, --nao-interativo desliga)
+if [ "$INTERATIVO" = auto ]; then
+  if { [ -z "$SISTEMA" ] || [ "${#REPOS[@]}" -eq 0 ]; } && { : </dev/tty; } 2>/dev/null; then
+    INTERATIVO=1
+  else
+    INTERATIVO=0
+  fi
+fi
+if [ "$INTERATIVO" = 0 ]; then
+  [ -n "$SISTEMA" ] || { echo "Falta --sistema (ou rode num terminal para responder às perguntas)" >&2; uso 1; }
+  [ "${#REPOS[@]}" -gt 0 ] || { echo "Falta ao menos um --repo (ou rode num terminal)" >&2; uso 1; }
+fi
 
-BASE="/opt/$SISTEMA"
 USUARIO="$(id -un)"
 GRUPO="$(id -gn)"
 PENDENCIAS=()
@@ -115,6 +134,116 @@ confirmar() {
   # 2> antes de </dev/tty: sem terminal (ssh sem -t, CI), a falha ao abrir não aparece
   read -r -p "    $1 [s/N] " resp 2>/dev/null </dev/tty || return 1
   [[ "$resp" =~ ^[sS]$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Perguntas do modo interativo. Leem de /dev/tty: funcionam também com curl ... | bash.
+# As opções de escolher/escolher_varios são "valor|texto mostrado".
+
+# sim_nao "Pergunta" s|n: pergunta de configuração, que o --sim não responde sozinho
+sim_nao() {
+  local resp=""
+  read -r -p "  $1 [$([ "$2" = s ] && echo S/n || echo s/N)] " resp </dev/tty || falha "sem resposta para: $1"
+  resp="${resp:-$2}"
+  [[ "$resp" =~ ^[sS]$ ]]
+}
+
+# perguntar VAR "Pergunta" [padrão] [regex]: sem regex, a resposta é obrigatória
+perguntar() {
+  local -n __resp_var="$1"
+  local texto="$2" padrao="${3:-}" regex="${4:-.}" resp=""
+  while true; do
+    read -r -p "  $texto${padrao:+ [$padrao]}: " resp </dev/tty || falha "sem resposta para: $texto"
+    resp="${resp:-$padrao}"
+    [[ "$resp" =~ $regex ]] && break
+    echo "    Valor inválido." >/dev/tty
+  done
+  __resp_var="$resp"
+}
+
+# perguntar_segredo VAR "Pergunta": não mostra o que é digitado; Enter deixa vazio
+perguntar_segredo() {
+  local -n __seg_var="$1"
+  local resp=""
+  read -rs -p "  $2: " resp </dev/tty || true
+  echo >/dev/tty
+  __seg_var="$resp"
+}
+
+# escolher VAR "Pergunta" N_PADRÃO "valor|texto" ...: uma opção, pelo número
+escolher() {
+  local -n __esc_var="$1"
+  local texto="$2" padrao="$3" i=1 op resp
+  shift 3
+  echo "  $texto" >/dev/tty
+  for op in "$@"; do
+    printf '    %d) %s\n' "$i" "${op#*|}" >/dev/tty
+    i=$((i + 1))
+  done
+  while true; do
+    read -r -p "  Escolha [$padrao]: " resp </dev/tty || falha "sem resposta para: $texto"
+    resp="${resp:-$padrao}"
+    if [[ "$resp" =~ ^[0-9]+$ ]] && [ "$resp" -ge 1 ] && [ "$resp" -le $# ]; then
+      op="${!resp}"
+      __esc_var="${op%%|*}"
+      return
+    fi
+    echo "    Digite um número de 1 a $#." >/dev/tty
+  done
+}
+
+# escolher_varios ARRAY "Pergunta" "NÚMEROS MARCADOS" "valor|texto" ...: várias opções
+escolher_varios() {
+  local -n __varios_var="$1"
+  local texto="$2" padrao="$3" i=1 op resp n valido marca
+  shift 3
+  echo "  $texto" >/dev/tty
+  for op in "$@"; do
+    marca=" "
+    [[ " $padrao " == *" $i "* ]] && marca=x
+    printf '    [%s] %d) %s\n' "$marca" "$i" "${op#*|}" >/dev/tty
+    i=$((i + 1))
+  done
+  while true; do
+    read -r -p "  Números separados por espaço (Enter: os marcados; 0: nenhum): " resp </dev/tty \
+      || falha "sem resposta para: $texto"
+    resp="${resp:-$padrao}"
+    __varios_var=()
+    valido=1
+    for n in ${resp//,/ }; do
+      if [ "$n" = 0 ]; then
+        __varios_var=()
+        break
+      elif [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le $# ]; then
+        op="${!n}"
+        __varios_var+=("${op%%|*}")
+      else
+        valido=0
+      fi
+    done
+    [ "$valido" = 1 ] && return
+    echo "    Use números de 1 a $#." >/dev/tty
+  done
+}
+
+# Opções de branch: as candidatas que existem, na ordem dada, mais "outra"
+escolher_branch() {
+  local __destino="$1" texto="$2" existentes="$3" padrao_novo="$4"
+  shift 4
+  local opcoes=() b escolha
+  for b in "$@"; do
+    grep -qx "$b" <<<"$existentes" && opcoes+=("$b|$b")
+  done
+  if [ "${#opcoes[@]}" -eq 0 ]; then
+    perguntar "$__destino" "$texto" "$padrao_novo" '^[A-Za-z0-9._/-]+$'
+    return
+  fi
+  opcoes+=("__outra|outra (digitar o nome)")
+  escolher escolha "$texto" 1 "${opcoes[@]}"
+  if [ "$escolha" = __outra ]; then
+    perguntar escolha "Nome da branch" "$padrao_novo" '^[A-Za-z0-9._/-]+$'
+  fi
+  printf -v "$__destino" '%s' "$escolha"
 }
 
 # Chamada à API do GitHub com o GH_TOKEN
@@ -153,6 +282,117 @@ ler_repo() {
 [ "$(id -u)" -ne 0 ] || falha "rode com o usuário do deploy, não como root"
 # sudo -n true antes: com NOPASSWD numa regra e senha em outra, o sudo -v pede senha mesmo assim
 sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sudo"
+
+# ---------------------------------------------------------------------------
+# Modo interativo: pergunta só o que não veio na linha de comando
+if [ "$INTERATIVO" = 1 ]; then
+  { : </dev/tty; } 2>/dev/null || falha "o modo interativo precisa de um terminal"
+  printf '\n\033[1;34m==> Configuração\033[0m (Enter aceita o valor entre colchetes)\n'
+
+  if [ "$FORGE_DEFINIDO" = 0 ] && [ "${#REPOS[@]}" -eq 0 ]; then
+    escolher FORGE "Onde estão os repositórios?" 1 \
+      "github|GitHub (deploy key e runner cadastrados pelo script, com GH_TOKEN)" \
+      "gitlab|GitLab (deploy key e runner manuais, com passo a passo)"
+    if [ "$FORGE" = gitlab ]; then
+      perguntar GIT_HOST "Endereço do GitLab" gitlab.com '^[A-Za-z0-9.:-]+$'
+    fi
+  fi
+
+  if [ "${#REPOS[@]}" -eq 0 ]; then
+    while true; do
+      perguntar repo "Repositório (DONO/REPO, ex.: SEMIT-SUAS/siscon)" "" '^[^/[:space:]]+(/[^/[:space:]]+)+$'
+      REPOS+=("$repo")
+      sim_nao "Adicionar outro repositório do mesmo sistema (ex.: API e frontend separados)?" n || break
+    done
+    # Com vários, cada um ganha uma subpasta e, se quiser, labels extras do runner
+    if [ "${#REPOS[@]}" -gt 1 ]; then
+      for i in "${!REPOS[@]}"; do
+        slug="${REPOS[$i]}"
+        perguntar pasta "Subpasta de $slug em /opt/<sistema>" "${slug##*/}" '^[A-Za-z0-9._-]+$'
+        REPOS[$i]="$slug:$pasta"
+      done
+    fi
+  fi
+
+  if [ -z "$SISTEMA" ]; then
+    sugestao="$(sed -E 's#.*/##; s/[^A-Za-z0-9_-]+/-/g' <<<"${REPOS[0]%%:*}" | tr '[:upper:]' '[:lower:]')"
+    perguntar SISTEMA "Nome do sistema (pastas em /opt/NOME)" "$sugestao" '^[a-z0-9_-]+$'
+  fi
+
+  if [ "$FORGE" = github ] && [ -z "${GH_TOKEN:-}" ]; then
+    echo "  GH_TOKEN: token com escopo repo e admin no repositório (na sua máquina: gh auth token)."
+    perguntar_segredo GH_TOKEN "Cole o GH_TOKEN (Enter para pular: deploy key e runner ficam manuais)"
+    [ -n "$GH_TOKEN" ] && export GH_TOKEN
+  fi
+
+  # Branches: com GH_TOKEN, oferece as que existem no primeiro repositório
+  branches=""
+  if [ "$FORGE" = github ] && [ -n "${GH_TOKEN:-}" ]; then
+    branches="$(gh_api GET "repos/${REPOS[0]%%:*}/branches?per_page=100" 2>/dev/null \
+      | grep -oE '"name": *"[^"]+"' | cut -d'"' -f4 || true)"
+  fi
+  if [ -z "$PROD_BRANCH" ]; then
+    escolher_branch PROD_BRANCH "Branch de produção" "$branches" main main master production prod
+  fi
+  if [ -z "$HML_BRANCH" ]; then
+    escolher_branch HML_BRANCH "Branch de homologação" "$branches" dev \
+      dev develop developer homolog homologacao staging hml
+    if [ -n "$branches" ] && ! grep -qx "$HML_BRANCH" <<<"$branches"; then
+      echo "    A branch $HML_BRANCH ainda não existe: crie-a (a partir de $PROD_BRANCH) antes do clone."
+    fi
+  fi
+
+  # PostgreSQL da máquina: banco de homologação e acesso da rede Docker aos bancos de produção
+  if [ -d /etc/postgresql ] && [ -z "$PG_HML" ]; then
+    hml_sugerido="$(tr '-' '_' <<<"$SISTEMA")_hml"
+    escolher PG_HML "Banco de homologação no PostgreSQL da máquina" 1 \
+      "$hml_sugerido|criar $hml_sugerido (banco e usuário novos, vazios)" \
+      "|não criar (já existe ou fica em outro servidor)"
+  fi
+  if [ -d /etc/postgresql ] && [ "${#PG_ACESSOS[@]}" -eq 0 ]; then
+    bancos="$(sudo -u postgres psql -tAc "SELECT datname || '|' || pg_get_userbyid(datdba) FROM pg_database
+      WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1" 2>/dev/null || true)"
+    if [ -n "$bancos" ]; then
+      # Sem os de homologação; já marcados os que têm o nome do sistema (superflow-db, superflow_db...)
+      opcoes=() liberar=() marcados="" i=1
+      raiz_nome="$(tr '_-' '..' <<<"$SISTEMA")"
+      while IFS='|' read -r db dono; do
+        [[ "$db" == *_hml || "$db" == "$PG_HML" ]] && continue
+        opcoes+=("$db|$db (dono: $dono)")
+        [[ "$(tr '_-' '..' <<<"$db")" == *"$raiz_nome"* ]] && marcados+="$i "
+        i=$((i + 1))
+      done <<<"$bancos"
+      [ "${#opcoes[@]}" -eq 0 ] || escolher_varios liberar \
+        "Bancos de produção que os contêineres vão acessar (libera no pg_hba.conf)" "${marcados% }" "${opcoes[@]}"
+      for db in "${liberar[@]}"; do
+        dono="$(grep -m1 "^$db|" <<<"$bancos" | cut -d'|' -f2)"
+        perguntar usuario "Usuário que acessa $db" "$dono" '^[A-Za-z0-9_-]+$'
+        PG_ACESSOS+=("$db:$usuario")
+      done
+    fi
+  fi
+
+  if [ -z "$DEPLOY" ]; then
+    escolher DEPLOY "Ao final" 1 \
+      "0|só preparar a VM (o deploy fica para depois, ou para o push)" \
+      "1|preparar e fazer o primeiro deploy, homologação primeiro (se não houver pendências)"
+  fi
+
+  # Comando equivalente, para repetir sem perguntas (o GH_TOKEN nunca entra aqui)
+  cmd="bash setup-host.sh --sistema $SISTEMA"
+  [ "$FORGE" = gitlab ] && cmd+=" --gitlab $GIT_HOST"
+  for r in "${REPOS[@]}"; do cmd+=" --repo $r"; done
+  cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
+  [ -n "$PG_HML" ] && cmd+=" --pg-hml $PG_HML"
+  for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-acesso $a"; done
+  [ "$DEPLOY" = 1 ] && cmd+=" --deploy"
+  printf '\n  Comando equivalente:\n    %s\n\n' "$cmd"
+  sim_nao "Continuar?" s || { echo "Nada foi alterado."; exit 0; }
+fi
+
+PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
+[[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
+BASE="/opt/$SISTEMA"
 if [ "$FORGE" = gitlab ]; then
   echo "GitLab ($GIT_HOST): deploy keys e runner ficam manuais; o script mostra o passo a passo."
 elif [ -z "${GH_TOKEN:-}" ]; then
@@ -202,7 +442,8 @@ for pid in $(pgrep -f 'PM2 v[0-9.]+: God Daemon' || true); do
   fi
   pm2_de() { sudo -u "$dono_pm2" env PATH="$(dirname "$node_bin"):/usr/local/bin:/usr/bin:/bin" PM2_HOME="$pm2_home" "$pm2_bin" "$@"; }
 
-  online="$(pm2_de jlist 2>/dev/null | grep -o '"status":"online"' | wc -l)"
+  # || true: sem processo online, o grep sai com 1 e o pipefail derrubaria o script
+  online="$( (pm2_de jlist 2>/dev/null || true) | { grep -o '"status":"online"' || true; } | wc -l)"
   if [ "$online" -eq 0 ]; then
     ok "PM2 de $dono_pm2: nenhum processo rodando"
     continue
@@ -495,6 +736,22 @@ for spec in "${REPOS[@]}"; do
       set_env "$env" "${kv%%=*}" "${kv#*=}"
     done
 
+    # Interativo e sem --segredos: escolhe no .env.example, já marcando os que parecem segredos
+    if [ "$INTERATIVO" = 1 ] && [ -z "$SEGREDOS" ] && [ "${SEGREDOS_PERGUNTADO:-0}" = 0 ] && [ -n "$exemplo" ]; then
+      SEGREDOS_PERGUNTADO=1
+      opcoes=() marcados="" i=1 escolhidos=()
+      while IFS= read -r chave; do
+        opcoes+=("$chave|$chave")
+        [[ "$chave" =~ SECRET|ENCRYPTION|JWT|SALT|SESSION ]] && marcados+="$i "
+        i=$((i + 1))
+      done < <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$exemplo" | tr -d = | grep -vE '^(APP_UID|APP_GID|NODE_ENV)$')
+      if [ "${#opcoes[@]}" -gt 0 ]; then
+        escolher_varios escolhidos "Chaves que recebem um segredo aleatório, diferente em cada ambiente" \
+          "${marcados% }" "${opcoes[@]}"
+        SEGREDOS="${escolhidos[*]}"
+      fi
+    fi
+
     # Segredos próprios de cada ambiente; os já definidos não mudam (mudar derruba sessões)
     for chave in $SEGREDOS; do
       atual="$(get_env "$env" "$chave")"
@@ -523,6 +780,35 @@ for spec in "${REPOS[@]}"; do
         chave="${linha%%=*}" valor="${linha#*=}"
         [ -n "$valor" ] && [ "$(get_env "$env" "$chave")" = "$valor" ] && iguais+=("$chave")
       done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$exemplo")
+
+      # Interativo: pede cada valor; Enter mantém o do exemplo e deixa como pendência
+      if [ "$INTERATIVO" = 1 ] && [ "${#iguais[@]}" -gt 0 ]; then
+        echo "    $amb: valores ainda iguais ao exemplo (Enter mantém)"
+        restantes=()
+        for chave in "${iguais[@]}"; do
+          if [[ "$chave" =~ SECRET|PASSWORD|SENHA|TOKEN|_KEY ]]; then
+            perguntar_segredo valor "$amb: $chave"
+          else
+            perguntar valor "$amb: $chave (exemplo: $(get_env "$exemplo" "$chave"))" "" '^.*$'
+          fi
+          if [ -z "$valor" ]; then
+            restantes+=("$chave")
+            continue
+          fi
+          # No contêiner, localhost é o próprio contêiner: o banco da máquina é host.docker.internal
+          if [[ "$valor" =~ @(localhost|127\.0\.0\.1)[:/] ]]; then
+            valor="${valor/@localhost/@host.docker.internal}"
+            valor="${valor/@127.0.0.1/@host.docker.internal}"
+            ok "$amb: $chave com localhost trocado por host.docker.internal"
+          fi
+          # Aspas simples: o Compose não interpreta espaço, # nem $ dentro delas
+          if [[ "$valor" =~ [[:space:]#\$] ]] && [[ ! "$valor" =~ ^[\"\'] ]] && [[ "$valor" != *"'"* ]]; then
+            valor="'$valor'"
+          fi
+          set_env "$env" "$chave" "$valor"
+        done
+        iguais=("${restantes[@]}")
+      fi
       [ "${#iguais[@]}" -eq 0 ] || aviso "Revise em $env (iguais ao exemplo): ${iguais[*]}"
     fi
   done

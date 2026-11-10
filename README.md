@@ -47,6 +47,8 @@ bash zero-downtime-deploy/scaffold.sh --sistema meusistema \
   --stack nextjs-prisma  ../meusistema
 ```
 
+Sem as opções, num terminal, ele pergunta o que faltar (`bash zero-downtime-deploy/scaffold.sh`): lê o repositório para sugerir nome, branches, stack e CI, oferece listas de escolha e, se já houver um CI antigo, pergunta se deve mantê-lo ou substituí-lo (o antigo fica em `.bak`). No fim mostra o comando equivalente, para repetir sem perguntas.
+
 O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
 
 ### 2. Prepare a VM
@@ -66,6 +68,8 @@ bash setup-host.sh --sistema meusistema --repo SEMIT-SUAS/meusistema \
   --env-prod NEXTAUTH_URL=https://meusistema.saoluis.ma.gov.br \
   --env-hml NEXTAUTH_URL=http://<IP da VM>:3001
 ```
+
+Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga.
 
 No fim, o script lista as **pendências**: o que precisa ser feito à mão, como valores do `.env` que continuam iguais ao exemplo. Resolva-as e rode o mesmo comando com `--deploy` para o primeiro deploy, homologação primeiro. Depois disso, cada push publica sozinho.
 
