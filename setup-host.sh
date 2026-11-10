@@ -12,6 +12,8 @@ SISTEMA="" PROD_NOME=production PROD_BRANCH="" HML_NOME=developer HML_BRANCH=""
 SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY="" SIM=0 INTERATIVO=auto
 REPOS=() PG_ACESSOS=() ENV_TODOS=() ENV_PROD=() ENV_HML=()
 SEGREDOS_PERGUNTADO=0 RETOMADO=0 ESTADO_ATIVO=0
+# Instalação atual de cada repositório (deploy antigo): "DONO/REPO=/pasta" ou só "/pasta"
+ORIGENS=()
 
 VERSAO=2.0.0
 
@@ -54,6 +56,12 @@ Opções:
   --pg-hml NOME           cria banco e usuário NOME no PostgreSQL da máquina
   --pg-acesso BANCO:USUARIO
                           repetível; libera o banco para a rede Docker no pg_hba.conf
+  --origem [DONO/REPO=]PASTA
+                          instalação atual do sistema na VM (ex.: o deploy antigo pelo PM2). A
+                          produção recebe os valores do .env dela e os arquivos enviados pelos
+                          usuários (pastas montadas), sincronizados de novo a cada execução; a
+                          homologação recebe o .env sem banco nem URLs. Sem a opção, o modo
+                          interativo procura e pergunta
   --gitlab HOST           repositórios no GitLab (gitlab.com ou um servidor próprio). A deploy
                           key e o runner ficam manuais: o script mostra o passo a passo
   --sem-clone             não clona (o workflow do sistema cria as pastas sozinho)
@@ -94,6 +102,7 @@ while [ $# -gt 0 ]; do
     --env-hml) ENV_HML+=("$2"); shift 2 ;;
     --pg-hml) PG_HML="$2"; shift 2 ;;
     --pg-acesso) PG_ACESSOS+=("$2"); shift 2 ;;
+    --origem) ORIGENS+=("$2"); shift 2 ;;
     --gitlab)
       FORGE=gitlab FORGE_DEFINIDO=1
       GIT_HOST="${2#*://}"
@@ -353,6 +362,43 @@ ler_repo() {
 sudo -n true 2>/dev/null || sudo -v || falha "o usuário $USUARIO precisa de sudo"
 
 # ---------------------------------------------------------------------------
+# Instalação atual (deploy antigo) de um repositório na VM
+
+# Pastas com .git cujo remoto é DONO/REPO, em /home, /root, /var/www, /srv e /opt (fora de
+# /opt/<sistema>). Lê o .git/config com sudo: serve para pastas de outros usuários.
+achar_instalacoes() {
+  local slug g url
+  slug="$(tr '[:upper:]' '[:lower:]' <<<"$1")"
+  sudo find /home /root /var/www /srv /opt -maxdepth 4 -name .git -type d \
+      -not -path "/opt/$SISTEMA/*" -not -path '*/node_modules/*' 2>/dev/null \
+    | while IFS= read -r g; do
+        url="$(sudo git config -f "$g/config" --get remote.origin.url 2>/dev/null || true)"
+        url="$(tr '[:upper:]' '[:lower:]' <<<"${url%.git}")"
+        if [[ "$url" == *[:/]"$slug" ]]; then dirname "$g"; fi
+      done || true
+}
+
+# Pasta da instalação atual escolhida para DONO/REPO (vazio: nenhuma)
+origem_de() {
+  local o
+  for o in "${ORIGENS[@]}"; do
+    if [[ "$o" == "$1="* ]]; then echo "${o#*=}"; return 0; fi
+    if [[ "$o" != *=* ]]; then echo "$o"; return 0; fi
+  done
+}
+
+# Pastas montadas como volume nos composes de uma pasta (- ./pasta:/app/pasta), uma por linha
+volumes_do_compose() {
+  grep -hoE '^[[:space:]]*-[[:space:]]*"?\./[^:"]+:' "$1"/*compose*.y*ml 2>/dev/null \
+    | sed -E 's/^[[:space:]]*-[[:space:]]*"?\.\///; s/:$//' | sort -u || true
+}
+
+# Chaves do .env antigo que não vão para a homologação: banco e endereço do próprio ambiente
+CHAVES_SO_PRODUCAO='^(DATABASE_URL|DIRECT_URL|SHADOW_DATABASE_URL|POSTGRES_[A-Z_]*|DB_[A-Z_]*|PG[A-Z_]*|NEXTAUTH_URL|AUTH_URL|APP_URL|BASE_URL|SITE_URL|PUBLIC_URL|NEXT_PUBLIC_[A-Z_]*URL)$'
+# Chaves de banco: localhost vira host.docker.internal (o banco fica fora do contêiner)
+CHAVES_DE_BANCO='^(DATABASE_URL|DIRECT_URL|SHADOW_DATABASE_URL|REDIS_URL|POSTGRES_HOST|DB_HOST|PGHOST)$'
+
+# ---------------------------------------------------------------------------
 # Estado salvo: as respostas e onde a execução parou, para continuar sem responder tudo de novo.
 # Um arquivo por sistema, só do usuário (chmod 600). O GH_TOKEN e os valores digitados para o
 # .env nunca entram aqui (os do .env já ficam gravados no próprio .env).
@@ -367,7 +413,7 @@ salvar_estado() {
   {
     echo "# setup-host.sh: respostas e situação da última execução de $SISTEMA. Pode apagar."
     declare -p FORGE GIT_HOST FORGE_DEFINIDO SISTEMA PROD_NOME PROD_BRANCH HML_NOME HML_BRANCH \
-      SEGREDOS SEGREDOS_PERGUNTADO PG_HML CLONAR DEPLOY REPOS PG_ACESSOS ENV_TODOS ENV_PROD ENV_HML
+      SEGREDOS SEGREDOS_PERGUNTADO PG_HML CLONAR DEPLOY REPOS PG_ACESSOS ENV_TODOS ENV_PROD ENV_HML ORIGENS
     printf 'ESTADO_DATA=%q\nESTADO_ETAPA=%q\nESTADO_FIM=%q\n' "$(date '+%d/%m/%Y %H:%M')" "$ETAPA_ATUAL" "$1"
     declare -p PENDENCIAS | sed 's/ PENDENCIAS=/ ESTADO_PENDENCIAS=/'
   } >"$arq.tmp"
@@ -492,6 +538,25 @@ if [ "$INTERATIVO" = 1 ]; then
     fi
   fi
 
+  # Instalação atual (ex.: deploy antigo pelo PM2): aproveitar o .env e os arquivos enviados
+  if [ "${#ORIGENS[@]}" -eq 0 ] && [ "$RETOMADO" = 0 ]; then
+    for spec in "${REPOS[@]}"; do
+      slug="${spec%%:*}"
+      mapfile -t achadas < <(achar_instalacoes "$slug")
+      [ "${#achadas[@]}" -gt 0 ] || continue
+      opcoes=()
+      for d in "${achadas[@]}"; do
+        ramo="$(sudo sed -n 's#^ref: refs/heads/##p' "$d/.git/HEAD" 2>/dev/null || true)"
+        info="branch ${ramo:-?}"
+        if sudo test -f "$d/.env"; then info+=", com .env"; fi
+        opcoes+=("$d|$d ($info)")
+      done
+      opcoes+=("|não aproveitar")
+      escolher origem "Instalação atual de $slug encontrada. Aproveitar o .env e os arquivos enviados pelos usuários dela? (o código vem do clone)" 1 "${opcoes[@]}"
+      if [ -n "$origem" ]; then ORIGENS+=("$slug=$origem"); fi
+    done
+  fi
+
   # PostgreSQL da máquina: banco de homologação e acesso da rede Docker aos bancos de produção
   if [ -d /etc/postgresql ] && [ -z "$PG_HML" ] && [ "$RETOMADO" = 0 ]; then
     hml_sugerido="$(tr '-' '_' <<<"$SISTEMA")_hml"
@@ -535,6 +600,7 @@ if [ "$INTERATIVO" = 1 ]; then
   cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
   [ -n "$PG_HML" ] && cmd+=" --pg-hml $PG_HML"
   for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-acesso $a"; done
+  for a in "${ORIGENS[@]}"; do cmd+=" --origem $a"; done
   [ "$DEPLOY" = 1 ] && cmd+=" --deploy"
   printf '\n  %s%s Para repetir sem perguntas:%s\n    %s%s%s\n\n' "$FRACO" "$I_INFO" "$RESET" "$CIANO" "$cmd" "$RESET"
   sim_nao "Continuar?" s || { printf '  %s%s Nada foi alterado.%s\n' "$AMARELO" "$I_AVISO" "$RESET"; exit 0; }
@@ -545,6 +611,9 @@ trap 'printf "\n\n  %s%s Interrompido em \"%s\". Rode o mesmo comando de novo pa
 PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
 [[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
 BASE="/opt/$SISTEMA"
+for a in "${ORIGENS[@]}"; do
+  sudo test -d "${a#*=}" || falha "--origem: pasta não encontrada: ${a#*=}"
+done
 ESTADO_ATIVO=1
 trap ao_sair EXIT
 salvar_estado andamento
@@ -893,11 +962,23 @@ for spec in "${REPOS[@]}"; do
     dest="$RAIZ/$amb"
     [ -d "$dest" ] || continue
 
+    origem="$(origem_de "$SLUG")"
+
     # Pastas montadas como volume (- ./pasta:/app/pasta nos composes): sem isto, o Docker as cria como root
     while IFS= read -r vol; do
-      if [ -n "$vol" ] && [[ "$vol" != *..* ]]; then mkdir -p "$dest/$vol"; fi
-    done < <(grep -hoE '^[[:space:]]*-[[:space:]]*"?\./[^:"]+:' "$dest"/*compose*.y*ml 2>/dev/null \
-      | sed -E 's/^[[:space:]]*-[[:space:]]*"?\.\///; s/:$//' | sort -u || true)
+      [ -n "$vol" ] && [[ "$vol" != *..* ]] || continue
+      mkdir -p "$dest/$vol"
+      # Produção: arquivos enviados na instalação atual. cp -u só traz o que é novo ou mudou,
+      # então rodar de novo logo antes da troca completa a cópia; nada é apagado no destino.
+      if [ -n "$origem" ] && [ "$amb" = "$PROD_NOME" ] && sudo test -d "$origem/$vol"; then
+        n="$(sudo find "$origem/$vol" -type f | wc -l)"
+        if [ "$n" -gt 0 ]; then
+          sudo cp -a -u "$origem/$vol/." "$dest/$vol/"
+          sudo chown -R "$USUARIO:$GRUPO" "$dest/$vol"
+          ok "$amb: $vol sincronizada com $origem/$vol ($n arquivos; rode de novo logo antes da troca)"
+        fi
+      fi
+    done < <(volumes_do_compose "$dest")
 
     exemplo="$(ls "$dest"/.env.example "$dest"/.env.exemple "$dest"/example.env "$dest"/env.example 2>/dev/null | head -1 || true)"
     env="$dest/.env"
@@ -907,6 +988,28 @@ for spec in "${REPOS[@]}"; do
       ok "$dest/.env criado a partir de $(basename "$exemplo")"
     fi
     chmod 600 "$env"
+
+    # Valores do .env da instalação atual, só onde o novo ainda está como no exemplo (ou sem a
+    # chave): o que já foi preenchido não é trocado. Na homologação, sem banco nem URLs.
+    if [ -n "$origem" ] && sudo test -f "$origem/.env"; then
+      trazidas=0
+      while IFS= read -r linha; do
+        chave="${linha%%=*}" valor="${linha#*=}"
+        if [ "$amb" = "$HML_NOME" ] && [[ "$chave" =~ $CHAVES_SO_PRODUCAO ]]; then continue; fi
+        if grep -qE "^$chave=" "$env"; then
+          atual="$(get_env "$env" "$chave")"
+          modelo=""
+          if [ -n "$exemplo" ]; then modelo="$(get_env "$exemplo" "$chave")"; fi
+          [ "$atual" = "$modelo" ] || continue
+        fi
+        if [[ "$chave" =~ $CHAVES_DE_BANCO ]]; then
+          valor="$(sed -E 's#(@|//)(localhost|127\.0\.0\.1)([:/]|$)#\1host.docker.internal\3#g' <<<"$valor")"
+        fi
+        set_env "$env" "$chave" "$valor"
+        trazidas=$((trazidas + 1))
+      done < <(sudo cat "$origem/.env" | tr -d '\r' | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true)
+      if [ "$trazidas" -gt 0 ]; then ok "$amb: $trazidas valor(es) trazido(s) de $origem/.env"; fi
+    fi
 
     # Dono dos volumes, quando os composes usam APP_UID
     if grep -qsE 'APP_UID' "$dest"/*compose*.y*ml; then
