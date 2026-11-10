@@ -144,6 +144,20 @@ escolher_branch() {
   printf -v "$__destino" '%s' "$escolha"
 }
 
+# Repositórios git perto de onde o usuário está: dentro da pasta atual e da de cima, da pasta
+# vizinha a este projeto e da home (um nível abaixo de cada uma). Pula pastas ocultas e
+# node_modules, e o próprio zero-downtime-deploy. Um caminho absoluto por linha, até 40.
+listar_repos() {
+  local atual="$1" raiz raizes=()
+  for raiz in "$PWD" "$(dirname "$PWD")" "$(dirname "$AQUI")" "$HOME" ${atual:+"$(dirname "$atual")"}; do
+    [ -d "$raiz" ] && raizes+=("$(cd "$raiz" && pwd)")
+  done
+  printf '%s\n' "${raizes[@]}" | sort -u | while IFS= read -r raiz; do
+    find "$raiz" -mindepth 1 -maxdepth 2 \( -name node_modules -o \( -name '.*' ! -name .git \) \) -prune \
+      -o -name .git -print 2>/dev/null || true  # pasta sem permissão não interrompe a busca
+  done | sed 's#/\.git$##' | grep -vxF "$AQUI" | sort -u | head -40
+}
+
 # Faltou algo obrigatório e há terminal: pergunta em vez de parar
 if [ "$INTERATIVO" = auto ]; then
   if { [ -z "$SISTEMA" ] || [ -z "$DOMINIO_PROD" ] || [ -z "$DOMINIO_HML" ] || [ -z "$DESTINO" ]; } \
@@ -160,9 +174,28 @@ if [ "$INTERATIVO" = 1 ]; then
   echo
 
   if [ -z "$DESTINO" ]; then
-    padrao=.
-    if git rev-parse --show-toplevel >/dev/null 2>&1; then padrao="$(git rev-parse --show-toplevel)"; fi
-    perguntar DESTINO "Pasta do repositório do sistema" "$padrao"
+    atual=""
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then atual="$(git rev-parse --show-toplevel)"; fi
+    echo "  Procurando repositórios git..." >/dev/tty
+    mapfile -t repos < <(listar_repos "$atual")
+    if [ "${#repos[@]}" -eq 0 ]; then
+      perguntar DESTINO "Pasta do repositório do sistema" "${atual:-.}"
+    else
+      opcoes=() n=1 i=1
+      for r in "${repos[@]}"; do
+        rotulo="${r/#$HOME/\~}"
+        ramo="$(git -C "$r" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        [ -n "$ramo" ] && rotulo="$rotulo  ($ramo)"
+        [ "$r" = "$atual" ] && { rotulo="$rotulo  <- pasta atual"; n=$i; }
+        opcoes+=("$r|$rotulo")
+        i=$((i + 1))
+      done
+      opcoes+=("__outra|outra pasta (digitar o caminho)")
+      escolher DESTINO "Pasta do repositório do sistema" "$n" "${opcoes[@]}"
+      if [ "$DESTINO" = __outra ]; then
+        perguntar DESTINO "Caminho do repositório" "${atual:-.}"
+      fi
+    fi
   fi
   DESTINO="${DESTINO/#\~/$HOME}"
   [ -d "$DESTINO" ] || falha "pasta não encontrada: $DESTINO"
