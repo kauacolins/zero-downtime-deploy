@@ -1,3 +1,3 @@
-# Junte ao .gitignore do sistema (o scaffold.sh --stack nextjs-prisma acrescenta sozinho)
+# Junte ao .gitignore do sistema (o scaffold.sh --stack nextjs-prisma acrescenta sozinho;
+# as pastas de upload ele acrescenta a partir de --volume)
 .env
-uploads/

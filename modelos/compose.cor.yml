@@ -6,7 +6,9 @@ services:
   # Nome genérico de propósito: o nome do serviço vira alias na rede web, compartilhada por
   # todos os ambientes e sistemas. O Nginx acha cada cor pelo container_name, que é exclusivo.
   app:
-    build: .
+    build:
+      context: .
+      # {{BUILD_ARGS}}
     image: {{SISTEMA}}:${APP_PREFIX:-}{{COR}}
     container_name: ${APP_PREFIX:-}{{COR}}_app
     restart: unless-stopped
@@ -14,11 +16,10 @@ services:
     # Banco no próprio servidor: use host.docker.internal no endereço do banco
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Dono de ./uploads no host (id -u, id -g); o setup-host.sh grava APP_UID e APP_GID no .env
+    # Dono das pastas montadas no host (id -u, id -g); o setup-host.sh grava APP_UID e APP_GID no .env
     user: "${APP_UID:-1000}:${APP_GID:-1000}"
     init: true
-    volumes:
-      - ./uploads:/app/uploads
+    # {{VOLUMES}}
     # Nunca publique portas aqui: só o Nginx expõe portas, senão as duas cores não sobem juntas
     networks: [web]
     healthcheck:

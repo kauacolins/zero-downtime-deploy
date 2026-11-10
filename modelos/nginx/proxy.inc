@@ -1,7 +1,7 @@
 # Comum aos dois ambientes. Gerado pelo zero-downtime-deploy (modelos/nginx/proxy.inc).
 
-# Maior envio aceito (uploads). Ajuste ao limite da aplicação.
-client_max_body_size 25m;
+# Maior envio aceito (uploads): um pouco acima do limite da aplicação
+client_max_body_size {{LIMITE_UPLOAD}};
 
 location / {
     proxy_pass http://$app_upstream;

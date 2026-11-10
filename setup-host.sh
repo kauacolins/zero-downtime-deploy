@@ -771,10 +771,11 @@ for spec in "${REPOS[@]}"; do
     dest="$RAIZ/$amb"
     [ -d "$dest" ] || continue
 
-    # Pastas montadas como volume: sem isto, o Docker as cria como root
-    for vol in uploads arquivos; do
-      grep -qsE "\./$vol:" "$dest"/*compose*.y*ml && mkdir -p "$dest/$vol"
-    done
+    # Pastas montadas como volume (- ./pasta:/app/pasta nos composes): sem isto, o Docker as cria como root
+    while IFS= read -r vol; do
+      if [ -n "$vol" ] && [[ "$vol" != *..* ]]; then mkdir -p "$dest/$vol"; fi
+    done < <(grep -hoE '^[[:space:]]*-[[:space:]]*"?\./[^:"]+:' "$dest"/*compose*.y*ml 2>/dev/null \
+      | sed -E 's/^[[:space:]]*-[[:space:]]*"?\.\///; s/:$//' | sort -u || true)
 
     exemplo="$(ls "$dest"/.env.example "$dest"/.env.exemple "$dest"/example.env "$dest"/env.example 2>/dev/null | head -1 || true)"
     env="$dest/.env"
@@ -888,6 +889,10 @@ if [ "$FORGE" = gitlab ]; then
   # para usar o grupo docker e gravar em /opt sem sudo
   projetos="$(for spec in "${REPOS[@]}"; do printf '%s ' "${spec%%:*}"; done)"
   projetos="${projetos% }"
+  # Tag pedida pelos jobs de deploy no .gitlab-ci.yml já clonado (o scaffold.sh --tag-runner a define)
+  tag_ci="$(grep -hoE '^[[:space:]]*tags:[[:space:]]*\[[^]]+\]' "$BASE"/*/*/.gitlab-ci.yml "$BASE"/*/.gitlab-ci.yml 2>/dev/null \
+    | head -1 | sed -E 's/.*\[[[:space:]]*//; s/[][[:space:]]//g' || true)"
+  tag_ci="${tag_ci:-$SISTEMA}"
   if command -v gitlab-runner >/dev/null && systemctl cat gitlab-runner >/dev/null 2>&1; then
     if systemctl show -p ExecStart --value gitlab-runner | grep -qE -- "--user[= ]$USUARIO( |;|$)"; then
       ok "gitlab-runner instalado como serviço do usuário $USUARIO"
@@ -913,7 +918,7 @@ if [ "$FORGE" = gitlab ]; then
       sudo gitlab-runner start
 
     Em cada projeto ($projetos):
-      No GitLab: Settings > CI/CD > Runners > New project runner, com a tag $SISTEMA.
+      No GitLab: Settings > CI/CD > Runners > New project runner, com a tag $tag_ci.
       Na versão 15 ou anterior, use o registration token mostrado na mesma tela.
       Depois, na VM:
         sudo gitlab-runner register --non-interactive --url https://$GIT_HOST \\
@@ -922,7 +927,7 @@ if [ "$FORGE" = gitlab ]; then
     No Ubuntu, o ~/.bash_logout limpa o terminal e faz o job falhar em "prepare environment":
       sed -i '/clear_console/s/^/#/' ~/.bash_logout
 
-    No .gitlab-ci.yml: tags: [$SISTEMA], GIT_STRATEGY: none e resource_group por ambiente.
+    No .gitlab-ci.yml: tags: [$tag_ci], GIT_STRATEGY: none e resource_group por ambiente.
 EOF
 else
 etapa "Runners do GitHub Actions"

@@ -85,6 +85,7 @@ if [ -f compose.migrate.yml ]; then
   docker compose -p "$PROJECT-migrate" -f compose.migrate.yml run --rm --build migrate
 fi
 
+# {{CRIAR_PASTAS}}
 color "$NEXT" up -d
 
 STATUS=""

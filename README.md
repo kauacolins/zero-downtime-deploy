@@ -49,6 +49,19 @@ bash zero-downtime-deploy/scaffold.sh --sistema meusistema \
 
 Sem as opções, num terminal, ele pergunta o que faltar (`bash zero-downtime-deploy/scaffold.sh`): lista as pastas com `.git` perto de você (pasta atual, a de cima, a vizinha a este projeto e a home) para escolher pelo número, lê o repositório para sugerir nome, branches, stack e CI, oferece listas de escolha e, se já houver um CI antigo, pergunta se deve mantê-lo ou substituí-lo (o antigo fica em `.bak`). No fim mostra o comando equivalente, para repetir sem perguntas.
 
+Ele também lê o código do sistema e adapta o que gera:
+
+| O que ele procura | O que faz |
+| --- | --- |
+| Pastas onde a aplicação grava (`public/uploads`, `storage`, `uploads`...) | Monta todas fora do contêiner, cria-as antes de subir e as tira do git e da imagem (documentos de usuários não podem ir para a imagem). `--volume` escolhe à mão; `--sem-volume`, nenhuma |
+| Pastas lidas em tempo de execução, como `data/` (stack Next.js) | Copia para a imagem, porque o build standalone não as inclui (`--copiar`) |
+| `NEXT_PUBLIC_*` no código | Passa como argumento de build, com o valor do `.env` de cada pasta: o Next grava essas variáveis no build |
+| `process.env.X` ausentes do `.env.example` | Acrescenta ao `.env.example`, de onde o `setup-host.sh` cria o `.env` |
+| `package.json` | Monta o job de teste: versão do Node, `npm ci`, `prisma generate`, `tsc` ou `typecheck` e `test` |
+| `next.config` sem `output: "standalone"` (stack Next.js) | Acrescenta; avisa se o código usa Server Actions sem `allowedOrigins` |
+
+Homologação só com IP atende apenas na porta de homologação; o IP na porta 80 é recusado, a menos que `--ip-prod` o mande para a produção. `--limite-upload` ajusta o maior envio aceito pelo Nginx (padrão `25m`) e, no GitLab, `--tag-runner` define a tag do runner da VM (padrão: o nome do sistema).
+
 O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
 
 ### 2. Prepare a VM
@@ -175,7 +188,7 @@ Só existe uma versão anterior disponível: o deploy seguinte compila na cor li
 - **Migrações compatíveis:** as duas versões usam o mesmo banco durante a troca. Para remover ou renomear uma coluna, primeiro faça a versão nova parar de usá-la e só remova no deploy seguinte.
 - **`.env.example`:** com todas as variáveis. O `setup-host.sh` cria o `.env` a partir dele.
 - **Origens permitidas:** frameworks que conferem a origem do pedido (Next.js Server Actions, Auth.js, CORS) precisam aceitar os domínios e o `IP:3001`.
-- **Estado fora do contêiner:** arquivos em `./uploads` (montada nas duas cores) e sessões em JWT ou armazenamento externo. Sessões em memória se perdem a cada deploy.
+- **Estado fora do contêiner:** arquivos nas pastas montadas (`--volume`, as mesmas nas duas cores) e sessões em JWT ou armazenamento externo. Sessões em memória se perdem a cada deploy.
 - **Dados de homologação:** o banco nasce vazio. Uma cópia de produção precisa ter os dados pessoais anonimizados (LGPD).
 
 ## Limites e cuidados
@@ -186,7 +199,7 @@ Só existe uma versão anterior disponível: o deploy seguinte compila na cor li
 - **Pedidos longos:** um pedido que dure mais de 10 segundos na versão antiga pode ser cortado. Aumente o `sleep` no `deploy.sh`, se necessário.
 - **Páginas abertas:** quem estiver com uma página da versão antiga pode ver um erro na próxima ação, até recarregar.
 - **Memória:** o build roda na VM, ao lado dos sistemas no ar. Um build de homologação pode deixar produção lenta.
-- **VM única:** se ela parar, os dois ambientes param. Mantenha backup dos bancos e de `uploads/`; o script não configura backup.
+- **VM única:** se ela parar, os dois ambientes param. Mantenha backup dos bancos e das pastas montadas; o script não configura backup.
 
 **Configuração e segurança:**
 

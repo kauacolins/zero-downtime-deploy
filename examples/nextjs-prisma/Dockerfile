@@ -17,6 +17,7 @@ CMD ["npx", "prisma", "migrate", "deploy"]
 
 FROM deps AS builder
 ENV NEXT_TELEMETRY_DISABLED=1 NODE_ENV=production
+# {{BUILD_ARGS_DOCKERFILE}}
 COPY . .
 # A pasta public é opcional no Next, mas o estágio final a copia
 RUN mkdir -p public && npm run build
@@ -26,8 +27,9 @@ ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
-# O compose escolhe o UID (dono de ./uploads no host); o cache do Next precisa aceitar qualquer um
-RUN mkdir -p uploads .next/cache && chmod -R a+rwX .next uploads
+# {{COPIAR_PASTAS}}
+# O compose escolhe o UID (dono das pastas montadas no host); o cache do Next precisa aceitar qualquer um
+RUN mkdir -p {{PASTAS_VOLUME}} .next/cache && chmod -R a+rwX .next {{PASTAS_VOLUME}}
 USER node
 EXPOSE 3000
 CMD ["node", "server.js"]

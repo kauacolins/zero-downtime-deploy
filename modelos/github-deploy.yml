@@ -17,8 +17,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # Testes do sistema aqui (ex.: npm ci && npm test, ./mvnw verify)
-      - run: echo "sem testes configurados"
+      # {{TESTE_PASSOS}}
 
   deploy:
     needs: test

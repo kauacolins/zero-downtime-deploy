@@ -2,21 +2,30 @@
 # Gerado pelo zero-downtime-deploy (modelos/gitlab-ci.yml). Inclua os testes do sistema no job test.
 stages: [test, deploy]
 
+# Sem pipeline duplicado: com merge request aberto, um push numa branch comum roda só o
+# pipeline do merge request. As branches de deploy rodam sempre, senão o deploy não sairia.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}" || $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 test:
   stage: test
-  # Runner compartilhado do GitLab; troque a imagem pela do sistema
-  image: alpine:3.20
+  # Runner compartilhado do GitLab
+  image: {{TESTE_IMAGEM}}
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}" || $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
   script:
-    # Testes do sistema aqui (ex.: npm ci && npm test, ./mvnw verify)
-    - echo "sem testes configurados"
+    # {{TESTE_SCRIPT}}
 
 .deploy:
   stage: deploy
-  # Runner da VM (executor shell), registrado com a tag do sistema
-  tags: [{{SISTEMA}}]
+  # Runner da VM (executor shell), registrado com esta tag
+  tags: [{{TAG_RUNNER}}]
   script:
     - cd "/opt/{{SISTEMA}}/$ENV_NAME"
     - git fetch origin
