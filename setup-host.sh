@@ -463,7 +463,9 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   if [ -z "$SISTEMA" ]; then
-    sugestao="$(sed -E 's#.*/##; s/[^A-Za-z0-9_-]+/-/g' <<<"${REPOS[0]%%:*}" | tr '[:upper:]' '[:lower:]')"
+    # Igual ao scaffold.sh (declaracao-isencao vira declaracao_isencao): o CI gerado por ele usa
+    # /opt/<sistema>, e um nome diferente aqui deixaria o deploy sem pasta
+    sugestao="$(sed -E 's#.*/##' <<<"${REPOS[0]%%:*}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_]+/_/g')"
     perguntar SISTEMA "Nome do sistema (pastas em /opt/NOME)" "$sugestao" '^[a-z0-9_-]+$'
   fi
 
@@ -742,6 +744,31 @@ if [ "$CLONAR" = 1 ]; then
         "$HOST_SSH" "$SSH_HOST" "$SSH_PORTA" "$CHAVE_SSH" >> "$HOME/.ssh/config"
     fi
 
+    # A deploy key gerada ainda não tem acesso: uma chave que já existe na VM pode ter
+    # (ex.: ~/.ssh/id_ed25519 de uma conta do GitLab). Ela serve, mas dá o acesso da conta inteira.
+    if ! GIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote "$url" >/dev/null 2>&1; then
+      for chave in "$HOME"/.ssh/id_ed25519 "$HOME"/.ssh/id_ecdsa "$HOME"/.ssh/id_rsa; do
+        [ -f "$chave" ] || continue
+        GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i $chave -p $SSH_PORTA" \
+          git ls-remote "git@$SSH_HOST:$SLUG.git" >/dev/null 2>&1 || continue
+        usar=existente
+        if [ "$SIM" = 0 ] && { : </dev/tty; } 2>/dev/null; then
+          escolher usar "$SLUG: a chave $chave já tem acesso ao repositório. Qual usar?" 1 \
+            "existente|$(basename "$chave") (já funciona; é chave de usuário: a VM fica com o acesso da conta)" \
+            "deploy|a deploy key gerada (só leitura deste repositório; cadastre-a no $GIT_HOST)"
+        fi
+        if [ "$usar" = existente ]; then
+          tmp="$(mktemp)"
+          H="$HOST_SSH" K="$chave" awk '
+            /^Host / { dentro = ($2 == ENVIRON["H"]) }
+            dentro && /^[[:space:]]*IdentityFile / { print "  IdentityFile " ENVIRON["K"]; next }
+            { print }' "$HOME/.ssh/config" >"$tmp" && cat "$tmp" >"$HOME/.ssh/config"
+          rm -f "$tmp"
+          ok "$SLUG: acesso pela chave existente $chave (para só leitura, troque por uma deploy key)"
+        fi
+        break
+      done
+    fi
     if ! GIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote "$url" >/dev/null 2>&1; then
       if [ "$FORGE" = gitlab ]; then
         echo "    $SLUG: cadastre a chave abaixo em https://$GIT_HOST/$SLUG/-/settings/repository"
@@ -856,6 +883,10 @@ fi
 
 # ---------------------------------------------------------------------------
 etapa "Arquivos .env"
+# Banco de homologação criado numa execução anterior, quando o .env ainda não existia
+if [ -z "$PG_URL" ] && [ -n "$PG_HML" ] && [ -f "$BASE/$PG_HML.url" ]; then
+  PG_URL="$(head -1 "$BASE/$PG_HML.url")"
+fi
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
   for amb in "$PROD_NOME" "$HML_NOME"; do
@@ -970,7 +1001,10 @@ done
 
 if [ -n "$PG_URL" ] && [ "$PG_URL_USADA" = 0 ]; then
   printf '%s\n' "$PG_URL" > "$BASE/$PG_HML.url" && chmod 600 "$BASE/$PG_HML.url"
-  aviso "Endereço do banco $PG_HML salvo em $BASE/$PG_HML.url: copie para o .env de homologação"
+  aviso "Endereço do banco $PG_HML salvo em $BASE/$PG_HML.url: rode de novo depois do clone (ou copie para o .env de homologação)"
+elif [ "$PG_URL_USADA" = 1 ] && [ -f "$BASE/$PG_HML.url" ]; then
+  # Tem a senha do banco: não fica para trás depois de usado
+  rm -f "$BASE/$PG_HML.url"
 fi
 
 # ---------------------------------------------------------------------------
@@ -990,7 +1024,11 @@ if [ "$FORGE" = gitlab ]; then
     else
       aviso "gitlab-runner não roda como $USUARIO: refaça o install do passo a passo abaixo"
     fi
-    registrados="$(sudo gitlab-runner list 2>&1 | grep -cE "URL=https?://$GIT_HOST" || true)"
+    # No config.toml, e não no gitlab-runner list: a saída dele tem códigos de cor no meio
+    # (URL, código de cor, =https://...), e a busca não achava o runner registrado
+    # O do serviço (/etc); o da home só vale quando o serviço não tem um
+    registrados="$( { sudo cat /etc/gitlab-runner/config.toml 2>/dev/null || cat "$HOME/.gitlab-runner/config.toml" 2>/dev/null; } \
+      | grep -cE "^[[:space:]]*url[[:space:]]*=[[:space:]]*\"https?://$GIT_HOST/?\"" || true)"
     if [ "$registrados" -gt 0 ]; then
       ok "$registrados runner(s) registrado(s) em $GIT_HOST: confira se atendem $projetos"
     else
