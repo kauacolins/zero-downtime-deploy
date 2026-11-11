@@ -1,0 +1,3 @@
+# Junte ao .gitignore do sistema (o scaffold.sh acrescenta sozinho;
+# as pastas de upload ele acrescenta a partir de --volume)
+.env

@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+Dockerfile
+nginx-static.conf
+compose.*.yml
+deploy.sh
+deploy.conf
+.github
+.gitlab-ci.yml
+nginx
+*.md

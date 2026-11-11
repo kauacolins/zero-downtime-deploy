@@ -108,11 +108,32 @@ O `scaffold.sh` detecta a stack pelo repositório e sugere a mais específica:
 | [`nextjs`](examples/nextjs) | `package.json` com `next` | Next standalone, rota de saúde |
 | [`node`](examples/node) | `package.json` | `npm run build` (se houver) e `npm start`; a rota de saúde fica com o sistema |
 | [`spa`](examples/spa) | `package.json` com `vite` | Build servido por Nginx sem root, rotas do navegador no `index.html`, `VITE_*` no build |
-| [`dockerfile`](examples/dockerfile) | Um `Dockerfile` no repositório | Nada é copiado: pergunta a porta, a rota de saúde e a migração. Serve para PHP, Python, Java, Go... |
+| [`node-prisma`](examples/node-prisma) | `package.json` com `prisma` (sem `next`) | API Node com o Prisma CLI na imagem; migração `npx prisma migrate deploy` |
+| [`python`](examples/python) | `requirements.txt` ou `pyproject.toml` | `pip install` e o comando de início (`--start-cmd`, sugerido para Flask, Django e FastAPI) |
+| [`java-maven`](examples/java-maven) | `pom.xml` | `mvn package` e `java -jar`, com a versão do Java do `pom.xml`; saúde em `/actuator/health` |
+| [`static`](examples/static) | `index.html`, sem build | Nginx sem root servindo os arquivos |
+| [`dockerfile`](examples/dockerfile) | Um `Dockerfile` no repositório | Nada é copiado: pergunta a porta (lida do `EXPOSE`), a rota de saúde e a migração. Serve para PHP, Go... |
 
 Migração sem Prisma: `--migrate-cmd` (ex.: `php artisan migrate --force`, `alembic upgrade head`, `npm run migrate`). O comando vai para o `deploy.conf`, e o `deploy.sh` o roda na imagem nova, com o `.env` do ambiente, antes de trocar a cor. Se falhar, a troca não acontece.
 
 Uma stack nova é uma pasta em `examples/` com um `stack.conf` (detecção e padrões) e os arquivos a copiar. Veja o [`stack.conf` do Next.js](examples/nextjs/stack.conf).
+
+O health check do compose tenta `wget`, `curl`, `node`, `python3` e `php`, então serve para imagens sem `wget` nem `curl` (como `python:slim`).
+
+### Monorepo (front e API no mesmo repositório)
+
+Quando a raiz não é de nenhuma stack, o `scaffold.sh` procura aplicações nas subpastas (ex.: `frontend/` e `backend/`, `apps/web/` e `apps/api/`), deixando de fora pastas de infraestrutura como `docker/`. Cada uma ganha os arquivos da sua stack. Juntas, viram um sistema só:
+
+- **Um serviço por aplicação** no compose de cada cor. Blue-green troca todas juntas, então front e API ficam sempre na mesma versão. O deploy só troca quando todas estão saudáveis.
+- **Um domínio, rotas por caminho:** o Nginx manda `/api/` para a API e `/` para o front, sem CORS. Por padrão, tira o `/api` antes de repassar, para a API que tem rotas começando em `/`. No modo interativo, ele pergunta.
+- **Um `.env` por ambiente** para todas as aplicações, a partir de um `.env.example` na raiz que junta os de cada pasta. A porta de cada uma vai no `environment` do compose.
+- **Migração** na aplicação escolhida (`--migrate-app`): a API com Prisma já vem sugerida.
+
+```bash
+bash scaffold.sh --app web:frontend --app api:backend:node-prisma:3000:/api
+```
+
+No `deploy.conf`, as aplicações ficam em `APPS`, como `nome:pasta:stack:porta:rota:saúde:prefixo`. O front chama a API por `/api` no mesmo domínio (ex.: `VITE_API_URL=/api`).
 
 ### 2. Prepare a VM
 

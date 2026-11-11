@@ -1015,7 +1015,16 @@ for spec in "${REPOS[@]}"; do
     [ -d "$dest/.git" ] || continue
     faltam=()
     [ -f "$dest/deploy.sh" ] || faltam+=("deploy.sh")
-    [ -f "$dest/Dockerfile" ] || faltam+=("Dockerfile")
+    # Monorepo (APPS no deploy.conf): um Dockerfile em cada pasta de aplicação
+    apps_conf="$(sed -n 's/^APPS=//p' "$dest/deploy.conf" 2>/dev/null | tr -d "\"'\r" || true)"
+    if [ -n "$apps_conf" ]; then
+      for a in $apps_conf; do
+        pasta_app="$(cut -d: -f2 <<<"$a")"
+        [ -f "$dest/$pasta_app/Dockerfile" ] || faltam+=("$pasta_app/Dockerfile")
+      done
+    else
+      [ -f "$dest/Dockerfile" ] || faltam+=("Dockerfile")
+    fi
     compgen -G "$dest/*blue*.y*ml" >/dev/null || faltam+=("compose da cor blue")
     compgen -G "$dest/*green*.y*ml" >/dev/null || faltam+=("compose da cor green")
     if [ "$FORGE" = gitlab ]; then

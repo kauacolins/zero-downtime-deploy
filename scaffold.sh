@@ -39,6 +39,14 @@ Opções:
   --stack NOME                copia também os arquivos de examples/NOME: nextjs-prisma, nextjs,
                               node, spa (Vite) ou dockerfile (o Dockerfile do próprio sistema).
                               Sem a opção, o script detecta a stack pelo repositório
+  --app NOME:PASTA[:STACK[:PORTA[:ROTA[:SAUDE[:PREFIXO]]]]]
+                              monorepo: uma aplicação por subpasta, repetível (ex.: --app
+                              web:apps/web --app api:apps/api:node-prisma:3333:/api). Todas trocam
+                              de cor juntas, no mesmo domínio: o Nginx manda cada ROTA para a sua
+                              (PREFIXO remove, o padrão fora de /, tira a ROTA do caminho; mantem
+                              repassa como veio). Sem --app, o script procura nas subpastas
+  --migrate-app NOME          monorepo: aplicação em que o --migrate-cmd roda
+  --start-cmd "COMANDO"       stack python: comando que sobe a aplicação (o script sugere)
   --migrate-cmd "COMANDO"     migração do banco, rodada na imagem nova antes da troca (ex.:
                               "php artisan migrate --force"); a stack nextjs-prisma já tem a sua
   --upgrade                   gera de novo os arquivos de deploy (os que têm "Gerado pelo
@@ -94,9 +102,16 @@ PROD_NOME="" PROD_BRANCH="" HML_NOME="" HML_BRANCH="" CI="" STACK="" STACK_DEFIN
 SEM_HML=0 SEM_HML_DEF=0
 INTERATIVO=auto SUBSTITUIR_CI=0 FORCE_DYNAMIC=0 CHECK_BUILD=""
 MIGRATE_CMD="" MIGRATE_DEF=0 UPGRADE=0 BUILD_ARGS_CONF=() BUILD_ARGS_DEF=0 CONF_LIDO=0
+# Monorepo: uma aplicação por subpasta, "nome:pasta:stack:porta:rota:saúde:prefixo" (prefixo:
+# remove tira a rota do caminho antes de repassar; mantem repassa como veio)
+APPS_LIST=() APPS_DEF=0 MONO=0 MIGRATE_APP="" START_CMD="" START_DEF=0
+# Modo interno: prepara só uma aplicação do monorepo e grava o resultado neste arquivo
+SO_APP=""
 # Da stack escolhida (examples/<stack>/stack.conf)
 STACK_NEXTJS=0 STACK_PREFIXO="" STACK_VOLUMES_PADRAO=uploads STACK_APP_PORT="" STACK_HEALTH=""
 STACK_PERGUNTAR_APP=0 STACK_PERGUNTAR_MIGRACAO=0 STACK_HEALTH_PROPRIA=0
+STACK_MIGRATE_PADRAO="" STACK_PERGUNTAR_INICIO=0 JAVA_VERSAO=21
+SAIDA_BUILD=dist GO_VERSAO=1.23 GO_MAIN=. PHP_PUBLICO=""
 VOLUMES=() VOLUMES_DEF=0 COPIAR=() COPIAR_DEF=0 LIMITE_UPLOAD="" IP_PROD="" TAG_RUNNER=""
 
 while [ $# -gt 0 ]; do
@@ -117,6 +132,10 @@ while [ $# -gt 0 ]; do
     --replace-ci|--substituir-ci) SUBSTITUIR_CI=1; shift ;;
     --force-dynamic) FORCE_DYNAMIC=1; shift ;;
     --migrate-cmd) MIGRATE_CMD="$2"; MIGRATE_DEF=1; shift 2 ;;
+    --app) APPS_LIST+=("$2"); APPS_DEF=1; shift 2 ;;
+    --migrate-app) MIGRATE_APP="$2"; shift 2 ;;
+    --start-cmd) START_CMD="$2"; START_DEF=1; shift 2 ;;
+    --app-only) SO_APP="$2"; INTERATIVO=0; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --check-build) CHECK_BUILD=1; shift ;;
     --no-check-build) CHECK_BUILD=0; shift ;;
@@ -402,7 +421,8 @@ analisar_repositorio() {
   if [ "$BUILD_ARGS_DEF" = 1 ]; then
     NEXT_PUBLIC=("${BUILD_ARGS_CONF[@]}")
   elif [ -n "$prefixo" ]; then
-    mapfile -t NEXT_PUBLIC < <(grep_fontes -hoE "${prefixo}[A-Z0-9_]+" | sort -u)
+    prefixo="$(sed -E 's/ +/|/g' <<<"$prefixo")"
+    mapfile -t NEXT_PUBLIC < <(grep_fontes -hoE "($prefixo)[A-Z0-9_]+" | sort -u)
   fi
   mapfile -t ENV_CODIGO < <(detectar_env)
 }
@@ -584,6 +604,9 @@ carregar_conf() {
   if [ "$COPIAR_DEF" = 0 ] && tem_chave "$c" COPY; then read -ra COPIAR <<<"$(valor_conf "$c" COPY)"; COPIAR_DEF=1; fi
   if tem_chave "$c" BUILD_ARGS; then read -ra BUILD_ARGS_CONF <<<"$(valor_conf "$c" BUILD_ARGS)"; BUILD_ARGS_DEF=1; fi
   if [ "$MIGRATE_DEF" = 0 ] && tem_chave "$c" MIGRATE_CMD; then MIGRATE_CMD="$(valor_conf "$c" MIGRATE_CMD)"; MIGRATE_DEF=1; fi
+  if [ "$APPS_DEF" = 0 ] && tem_chave "$c" APPS; then read -ra APPS_LIST <<<"$(valor_conf "$c" APPS)"; APPS_DEF=1; fi
+  [ -n "$MIGRATE_APP" ] || MIGRATE_APP="$(valor_conf "$c" MIGRATE_APP)"
+  if [ "$START_DEF" = 0 ] && tem_chave "$c" START_CMD; then START_CMD="$(valor_conf "$c" START_CMD)"; START_DEF=1; fi
   printf '  %s%s Lendo %s: o que já está lá não é perguntado%s\n' "$FRACO" "$I_INFO" "deploy.conf" "$RESET" >&2
 }
 
@@ -591,15 +614,22 @@ carregar_conf() {
 # regra com texto vale 2, só com arquivo vale 1: a stack mais específica ganha
 pontuar_stack() {
   local conf="$1/stack.conf" regra arq texto pontos=0
+  local alt achou valor
   for regra in $(valor_conf "$conf" DETECTA); do
-    arq="${regra%%:*}" texto="${regra#*:}"
-    [ -f "$DESTINO/$arq" ] || { echo 0; return 0; }
-    if [ -n "$texto" ]; then
-      grep -qF -- "$texto" "$DESTINO/$arq" || { echo 0; return 0; }
-      pontos=$((pontos + 2))
-    else
-      pontos=$((pontos + 1))
-    fi
+    # Alternativas com |: vale a que der mais pontos
+    achou=0
+    for alt in ${regra//|/ }; do
+      arq="${alt%%:*}" texto="${alt#*:}" valor=0
+      [ -f "$DESTINO/$arq" ] || continue
+      if [ -n "$texto" ]; then
+        grep -qF -- "$texto" "$DESTINO/$arq" && valor=2
+      else
+        valor=1
+      fi
+      if [ "$valor" -gt "$achou" ]; then achou="$valor"; fi
+    done
+    [ "$achou" -gt 0 ] || { echo 0; return 0; }
+    pontos=$((pontos + achou))
   done
   echo "$pontos"
 }
@@ -625,7 +655,42 @@ carregar_stack() {
   local conf="$AQUI/examples/$STACK/stack.conf"
   STACK_NEXTJS=0 STACK_PREFIXO="" STACK_VOLUMES_PADRAO=uploads STACK_APP_PORT="" STACK_HEALTH=""
   STACK_PERGUNTAR_APP=0 STACK_PERGUNTAR_MIGRACAO=0 STACK_HEALTH_PROPRIA=0
+  STACK_MIGRATE_PADRAO="" STACK_PERGUNTAR_INICIO=0 JAVA_VERSAO=21
   [ -n "$STACK" ] && [ -f "$conf" ] || return 0
+  STACK_MIGRATE_PADRAO="$(valor_conf "$conf" MIGRATE_PADRAO)"
+  # SPA: pasta de saída do build (Vite e Vue CLI: dist; Create React App: build; Angular: angular.json)
+  SAIDA_BUILD=dist
+  if grep -qs '"react-scripts"' "$DESTINO/package.json"; then SAIDA_BUILD=build; fi
+  if [ -f "$DESTINO/angular.json" ]; then
+    local saida
+    saida="$(grep -oE '"outputPath": *"[^"]+"' "$DESTINO/angular.json" | head -1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+    if [ -n "$saida" ]; then
+      SAIDA_BUILD="$saida"
+      # Angular 17+ (builder application) põe os arquivos em <outputPath>/browser
+      if grep -qE '"builder": *"@angular(-devkit/build-angular|/build):application"' "$DESTINO/angular.json"; then SAIDA_BUILD+=/browser; fi
+    fi
+  fi
+  # Go: versão do go.mod e o pacote main (na raiz ou em cmd/<nome>/)
+  GO_VERSAO=1.23 GO_MAIN=.
+  if [ -f "$DESTINO/go.mod" ]; then
+    local gv gm
+    gv="$(grep -m1 -oE '^go [0-9]+\.[0-9]+' "$DESTINO/go.mod" | cut -d' ' -f2 || true)"
+    if [ -n "$gv" ]; then GO_VERSAO="$gv"; fi
+    if ! grep -qs '^package main' "$DESTINO"/*.go; then
+      gm="$(grep -ls '^package main' "$DESTINO"/cmd/*/main.go 2>/dev/null | head -1 || true)"
+      if [ -n "$gm" ]; then gm="${gm#"$DESTINO"/}"; GO_MAIN="./${gm%/main.go}"; fi
+    fi
+  fi
+  # PHP: raiz pública em public/ (Laravel) ou a própria pasta
+  PHP_PUBLICO=""
+  if [ -f "$DESTINO/public/index.php" ]; then PHP_PUBLICO=/public; fi
+  STACK_PERGUNTAR_INICIO="$(valor_conf "$conf" PERGUNTAR_INICIO)"; STACK_PERGUNTAR_INICIO="${STACK_PERGUNTAR_INICIO:-0}"
+  # Java: a versão do <java.version> do pom.xml
+  if [ -f "$DESTINO/pom.xml" ]; then
+    local jv
+    jv="$(grep -oE '<java.version>[0-9]+' "$DESTINO/pom.xml" | grep -oE '[0-9]+$' | head -1 || true)"
+    if [ -n "$jv" ]; then JAVA_VERSAO="$jv"; fi
+  fi
   STACK_NEXTJS="$(valor_conf "$conf" NEXTJS)"; STACK_NEXTJS="${STACK_NEXTJS:-0}"
   STACK_PREFIXO="$(valor_conf "$conf" BUILD_ARGS_PREFIXO)"
   STACK_VOLUMES_PADRAO="$(valor_conf "$conf" VOLUMES_PADRAO)"
@@ -644,6 +709,120 @@ carregar_stack() {
     fi
     if [ -n "$p" ]; then STACK_APP_PORT="$p"; fi
   fi
+}
+
+# Python: comando de início sugerido pelo framework
+sugerir_inicio() {
+  local wsgi
+  if grep -qiE '^(fastapi|uvicorn)' "$DESTINO/requirements.txt" 2>/dev/null || grep -qiE 'fastapi' "$DESTINO/pyproject.toml" 2>/dev/null; then
+    echo 'uvicorn main:app --host 0.0.0.0 --port $PORT'
+  elif grep -qiE '^django' "$DESTINO/requirements.txt" 2>/dev/null; then
+    wsgi="$(find "$DESTINO" -maxdepth 2 -name wsgi.py 2>/dev/null | head -1 || true)"
+    wsgi="${wsgi#"$DESTINO"/}"; wsgi="${wsgi%/wsgi.py}"
+    echo "gunicorn -b 0.0.0.0:\$PORT ${wsgi:-projeto}.wsgi"
+  else
+    echo 'gunicorn -b 0.0.0.0:$PORT app:app'
+  fi
+}
+
+# Aplicações em subpastas (monorepo), quando a raiz não é de nenhuma stack: "pasta:stack" por linha.
+# Procura um e dois níveis abaixo da raiz (ex.: backend/, apps/api/).
+# Pastas de infraestrutura (docker/, deploy/...) guardam Dockerfiles de outras pastas: não são aplicações
+# packages/: bibliotecas compartilhadas de um monorepo (apps/ são os sistemas)
+IGNORAR_APPS=" packages node_modules .git .github dist build out coverage test tests __tests__ e2e examples example scripts vendor target venv .venv public static templates prisma src lib docker deploy infra ops k8s helm "
+detectar_apps() {
+  local raiz="$DESTINO" d rel nome st achadas=() a dentro
+  while IFS= read -r d; do
+    rel="${d#"$raiz"/}"
+    nome="${rel##*/}"
+    [[ "$IGNORAR_APPS" == *" ${rel%%/*} "* || "$IGNORAR_APPS" == *" $nome "* ]] && continue
+    # Subpasta de uma aplicação já achada (ex.: docs/pt de docs) é parte dela
+    dentro=0
+    for a in "${achadas[@]}"; do [[ "$rel" == "$a/"* ]] && dentro=1; done
+    [ "$dentro" = 0 ] || continue
+    st="$(DESTINO="$d" detectar_stack)"
+    if [ -n "$st" ]; then echo "$rel:$st"; achadas+=("$rel"); fi
+  done < <(find "$raiz" -mindepth 1 -maxdepth 2 -type d \( -name node_modules -o -name '.*' \) -prune -o -type d -print 2>/dev/null | sort)
+  return 0
+}
+
+# package.json da raiz só orquestra as aplicações das subpastas (não é um servidor): workspaces,
+# scripts que entram em outra pasta (--prefix, --workspace, cd) ou nenhuma dependência
+raiz_orquestra() {
+  local pj="$DESTINO/package.json"
+  [ -f "$pj" ] || return 0
+  grep -q '"workspaces"' "$pj" && return 0
+  grep -qE '"(start|build|dev)": *"[^"]*(--prefix|--workspace|-w |cd )' "$pj" && return 0
+  grep -q '"dependencies"' "$pj" && return 1
+  return 0
+}
+
+# Completa uma entrada de APPS com os padrões da stack: nome:pasta:stack:porta:rota:saúde:prefixo
+completar_app() {
+  local nome pasta st porta rota saude prefixo
+  IFS=: read -r nome pasta st porta rota saude prefixo <<<"$1"
+  [ -n "$st" ] || st="$(DESTINO="$DESTINO/$pasta" detectar_stack)"
+  if [ -z "$porta" ] || [ -z "$saude" ]; then
+    local SALVA_STACK="$STACK" SALVA_DESTINO="$DESTINO"
+    STACK="$st" DESTINO="$DESTINO/$pasta"
+    carregar_stack
+    porta="${porta:-${STACK_APP_PORT:-3000}}" saude="${saude:-${STACK_HEALTH:-/health}}"
+    STACK="$SALVA_STACK" DESTINO="$SALVA_DESTINO"
+    carregar_stack
+  fi
+  if [ -z "$rota" ]; then
+    case "$st" in spa | static | nextjs*) rota=/ ;; *) rota=/api ;; esac
+  fi
+  if [ -z "$prefixo" ]; then
+    if [ "$rota" = / ]; then prefixo=mantem; else prefixo=remove; fi
+  fi
+  echo "$nome:$pasta:$st:$porta:$rota:$saude:$prefixo"
+}
+
+# Um serviço do compose (modelos/servico.yml) para uma aplicação
+servico_compose() {
+  local nome="$1" contexto="$2" sufixo="$3" porta="$4" saude="$5"
+  local BLOCO_VOLUMES="$6" BLOCO_AMBIENTE="$7"
+  export BLOCO_VOLUMES BLOCO_AMBIENTE
+  tail -n +2 "$AQUI/modelos/servico.yml" \
+    | sed -e "s|{{SERVICO}}|$nome|g" -e "s|{{CONTEXTO}}|$contexto|g" -e "s|{{SUFIXO_IMAGEM}}|$sufixo|g" \
+      -e "s|{{PORTA_SERVICO}}|$porta|g" -e "s|{{HEALTH_SERVICO}}|$saude|g" \
+    | preencher_blocos
+}
+
+# Destinos do Nginx num ambiente: um app só usa $app_upstream; monorepo, um location por aplicação
+locais_nginx() {
+  local pref="$1" ativo="$2" a nome pasta st porta rota saude prefixo saida=""
+  if [ "$MONO" = 0 ]; then
+    saida="    set \$app_upstream {{SISTEMA}}_${pref}blue_app:{{PORTA_APP}};"
+    if [ -z "$pref" ]; then saida+="$NL    # O curinga evita erro enquanto o ambiente ainda não teve deploy"; fi
+    saida+="$NL    include /etc/nginx/active/${ativo}*.inc;$NL    include /etc/nginx/conf.d/proxy.inc;"
+    echo "$saida"
+    return 0
+  fi
+  saida="    # Um destino por aplicação; o deploy.sh grava a cor ativa em /etc/nginx/active"
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    saida+="$NL    set \$up_$nome {{SISTEMA}}_${pref}blue_$nome:$porta;"
+  done
+  saida+="$NL    # O curinga evita erro enquanto o ambiente ainda não teve deploy"
+  saida+="$NL    include /etc/nginx/active/${ativo}*.inc;"
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    [ "$rota" != / ] || continue
+    saida+="$NL$NL    location ${rota%/}/ {"
+    if [ "$prefixo" = remove ]; then
+      saida+="$NL        # $nome recebe o caminho sem ${rota%/} (as rotas dela começam em /)"
+      saida+="$NL        rewrite ^${rota%/}/(.*)\$ /\$1 break;"
+    fi
+    saida+="$NL        proxy_pass http://\$up_$nome;$NL        include /etc/nginx/conf.d/proxy-headers.inc;$NL    }"
+  done
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    [ "$rota" = / ] || continue
+    saida+="$NL$NL    location / {$NL        proxy_pass http://\$up_$nome;$NL        include /etc/nginx/conf.d/proxy-headers.inc;$NL    }"
+  done
+  echo "$saida"
 }
 
 # Grava o deploy.conf com as respostas desta execução
@@ -679,6 +858,12 @@ escrever_conf() {
     echo "BUILD_ARGS=$(aspas "${NEXT_PUBLIC[*]}")"
     echo "# Migração do banco, rodada na imagem nova antes da troca (o deploy.sh lê daqui)"
     echo "MIGRATE_CMD=$(aspas "$MIGRATE_CMD")"
+    echo "# Monorepo: aplicações em subpastas, nome:pasta:stack:porta:rota:saúde:prefixo (vazio: uma só, na raiz)"
+    echo "APPS=$(aspas "${APPS_LIST[*]}")"
+    echo "# Monorepo: aplicação em que a migração roda"
+    echo "MIGRATE_APP=$MIGRATE_APP"
+    echo "# Stack python: comando que sobe a aplicação"
+    echo "START_CMD=$(aspas "$START_CMD")"
     echo "UPLOAD_LIMIT=$LIMITE_UPLOAD"
     echo "PROD_IP=$IP_PROD"
   } >"$c"
@@ -789,6 +974,39 @@ if [ "$INTERATIVO" = 1 ]; then
     fi
   fi
 
+  # Monorepo: a raiz não é de nenhuma stack, mas há aplicações em subpastas
+  raiz_st="$(detectar_stack)"
+  if [ "$STACK_DEFINIDA" = 0 ] && [ "$APPS_DEF" = 0 ] && { [ -z "$raiz_st" ] || { [ "$raiz_st" = node ] && raiz_orquestra; }; }; then
+    mapfile -t achadas < <(detectar_apps)
+    if [ "${#achadas[@]}" -gt 0 ]; then
+      opcoes=() marcados="" i=1
+      for e in "${achadas[@]}"; do
+        opcoes+=("$e|${e%%:*}  $FRACO(${e#*:})$RESET")
+        marcados+="${marcados:+ }$i"
+        i=$((i + 1))
+      done
+      escolher_varios escolhidas "Aplicações em subpastas (monorepo: trocam de cor juntas, no mesmo domínio)" "$marcados" "${opcoes[@]}"
+      tem_raiz=0
+      for e in "${escolhidas[@]}"; do
+        pasta="${e%%:*}" st="${e#*:}"
+        nome="$(tr '[:upper:]' '[:lower:]' <<<"${pasta##*/}" | sed -E 's/[^a-z0-9_]+/_/g')"
+        app="$(completar_app "$nome:$pasta:$st")"
+        IFS=: read -r nome pasta st porta rota saude prefixo <<<"$app"
+        if printf '%s\n' "${APPS_LIST[@]}" | cut -d: -f5 | grep -qxF "$rota"; then rota="/$nome"; prefixo=remove; fi
+        perguntar rota "$pasta: rota no domínio (/ para a raiz)" "$rota" '^/[A-Za-z0-9._/-]*$'
+        if [ "$rota" = / ]; then
+          tem_raiz=1 prefixo=mantem
+        elif sim_nao "$pasta: as rotas da aplicação já começam com $rota? (não: o Nginx tira $rota antes de repassar)" n; then
+          prefixo=mantem
+        else
+          prefixo=remove
+        fi
+        APPS_LIST+=("$nome:$pasta:$st:$porta:$rota:$saude:$prefixo")
+      done
+      if [ "${#APPS_LIST[@]}" -gt 0 ]; then APPS_DEF=1 STACK="" STACK_DEFINIDA=1; fi
+    fi
+  fi
+
   if [ "$STACK_DEFINIDA" = 0 ]; then
     detectada="$(detectar_stack)"
     opcoes=() n=0 i=1
@@ -814,12 +1032,42 @@ if [ "$INTERATIVO" = 1 ]; then
     perguntar PORTA_APP "Porta em que a aplicação ouve dentro do contêiner" "${PORTA_APP:-$STACK_APP_PORT}" '^[0-9]+$'
     perguntar HEALTH "Rota de saúde (200 só com a aplicação pronta, sem login)" "${HEALTH:-$STACK_HEALTH}" '^/'
   fi
+  if [ "$STACK_PERGUNTAR_INICIO" = 1 ] && [ "$START_DEF" = 0 ]; then
+    perguntar START_CMD "Comando que sobe a aplicação, ouvindo na porta \$PORT" "$(sugerir_inicio)" '.'
+    START_DEF=1
+  fi
   if [ "$STACK_PERGUNTAR_MIGRACAO" = 1 ] && [ "$MIGRATE_DEF" = 0 ]; then
-    perguntar MIGRATE_CMD "Comando de migração do banco, rodado na imagem nova antes da troca (Enter: nenhum)" "" '^.*$'
+    perguntar MIGRATE_CMD "Comando de migração do banco, rodado na imagem nova antes da troca (Enter: nenhum)" "$STACK_MIGRATE_PADRAO" '^.*$'
+    MIGRATE_DEF=1
+  fi
+  # Monorepo: migração na aplicação que a tiver (ex.: a API com Prisma)
+  if [ "${#APPS_LIST[@]}" -gt 0 ] && [ "$MIGRATE_DEF" = 0 ]; then
+    opcoes=() n=0 i=1
+    for a in "${APPS_LIST[@]}"; do
+      IFS=: read -r nome pasta st _ <<<"$a"
+      opcoes+=("$nome|$nome ($st)")
+      if [ "$n" = 0 ] && { [ -n "$(valor_conf "$AQUI/examples/$st/stack.conf" MIGRATE_PADRAO)" ] || [ "$st" = nextjs-prisma ]; }; then n=$i; fi
+      i=$((i + 1))
+    done
+    opcoes+=("|nenhuma (sem migração de banco)")
+    [ "$n" != 0 ] || n=$i
+    escolher MIGRATE_APP "Aplicação que roda a migração do banco antes da troca" "$n" "${opcoes[@]}"
+    if [ -n "$MIGRATE_APP" ]; then
+      for a in "${APPS_LIST[@]}"; do
+        IFS=: read -r nome pasta st _ <<<"$a"
+        [ "$nome" = "$MIGRATE_APP" ] || continue
+        if [ "$st" = nextjs-prisma ]; then
+          MIGRATE_CMD=""   # usa o compose.migrate.yml da stack, apontado para a pasta da aplicação
+        else
+          perguntar MIGRATE_CMD "$nome: comando de migração" "$(valor_conf "$AQUI/examples/$st/stack.conf" MIGRATE_PADRAO)" '^.*$'
+        fi
+      done
+    fi
     MIGRATE_DEF=1
   fi
 
   analisar_repositorio
+  if [ "${#APPS_LIST[@]}" -gt 0 ]; then VOLUMES_DEF=1 COPIAR_DEF=1; fi
   if [ "$VOLUMES_DEF" = 0 ]; then
     extra=""
     if [ "${#DET_VOLUMES[@]}" -gt 0 ]; then
@@ -873,8 +1121,47 @@ if [ -n "$STACK" ] && [ ! -f "$AQUI/examples/$STACK/stack.conf" ]; then
   echo "Stack desconhecida: $STACK. Disponíveis: $(ls "$AQUI/examples" | tr '\n' ' ')" >&2
   exit 1
 fi
+# Sem --stack nem deploy.conf: a stack detectada na raiz. Um package.json genérico (node) na raiz
+# com aplicações nas subpastas é só orquestração (workspaces, npm --prefix): vira monorepo
+if [ -z "$STACK" ] && [ "$STACK_DEFINIDA" = 0 ] && [ "${#APPS_LIST[@]}" -eq 0 ]; then
+  STACK="$(detectar_stack)"
+  if [ "$STACK" = node ] && [ -z "$SO_APP" ] && raiz_orquestra && [ -n "$(detectar_apps)" ]; then STACK=""; fi
+fi
+if [ -z "$SO_APP" ] && [ -z "$STACK" ] && [ "${#APPS_LIST[@]}" -eq 0 ] && [ "$STACK_DEFINIDA" = 0 ]; then
+  # Raiz sem stack: aplicações nas subpastas viram um monorepo
+  while IFS= read -r e; do
+    [ -n "$e" ] && APPS_LIST+=("$(tr '[:upper:]' '[:lower:]' <<<"${e%%:*}" | sed -E 's#.*/##; s/[^a-z0-9_]+/_/g'):${e%%:*}:${e#*:}")
+  done < <(detectar_apps)
+fi
+if [ "${#APPS_LIST[@]}" -gt 0 ]; then
+  MONO=1 STACK="" VOLUMES_DEF=1 COPIAR_DEF=1
+  completas=() raiz=0
+  for a in "${APPS_LIST[@]}"; do
+    a="$(completar_app "$a")"
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    [[ "$nome" =~ ^[a-z0-9_]+$ ]] || falha "--app: nome inválido ($nome): só minúsculas, números e _"
+    [ -d "$DESTINO/$pasta" ] || falha "--app: pasta não encontrada: $pasta"
+    [ -f "$AQUI/examples/$st/stack.conf" ] || falha "--app $nome: stack desconhecida ($st)"
+    # Duas aplicações na mesma rota (ex.: dois fronts em /): a segunda vai para /<nome>
+    if printf '%s\n' "${completas[@]}" | cut -d: -f5 | grep -qxF "$rota"; then rota="/$nome" prefixo=remove; fi
+    # Nomes únicos: viram serviço do compose e variável do Nginx
+    while printf '%s\n' "${completas[@]}" | grep -q "^$nome:"; do nome="${nome}_2"; done
+    completas+=("$nome:$pasta:$st:$porta:$rota:$saude:$prefixo")
+  done
+  APPS_LIST=("${completas[@]}")
+  # Migração: a aplicação escolhida, ou a primeira que tem uma (padrão da stack)
+  if [ -z "$MIGRATE_APP" ] && [ "$MIGRATE_DEF" = 0 ]; then
+    for a in "${APPS_LIST[@]}"; do
+      IFS=: read -r nome pasta st _ <<<"$a"
+      m="$(valor_conf "$AQUI/examples/$st/stack.conf" MIGRATE_PADRAO)"
+      if [ -n "$m" ] || [ "$st" = nextjs-prisma ]; then MIGRATE_APP="$nome" MIGRATE_CMD="$m"; break; fi
+    done
+  fi
+fi
 carregar_stack
 PORTA_APP="${PORTA_APP:-${STACK_APP_PORT:-3000}}" HEALTH="${HEALTH:-${STACK_HEALTH:-/api/health}}"
+if [ "$STACK_PERGUNTAR_INICIO" = 1 ] && [ -z "$START_CMD" ]; then START_CMD="$(sugerir_inicio)"; fi
+if [ "$STACK_PERGUNTAR_MIGRACAO" = 1 ] && [ "$MIGRATE_DEF" = 0 ] && [ -n "$STACK_MIGRATE_PADRAO" ]; then MIGRATE_CMD="$STACK_MIGRATE_PADRAO"; fi
 LIMITE_UPLOAD="${LIMITE_UPLOAD:-25m}" TAG_RUNNER="${TAG_RUNNER:-$SISTEMA}"
 [[ "$LIMITE_UPLOAD" =~ ^[0-9]+[kKmMgG]?$ ]] || falha "--upload-limit aceita um tamanho como 12m"
 [ -z "$IP_PROD" ] || [[ "$IP_PROD" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || falha "--prod-ip aceita um IPv4"
@@ -882,7 +1169,8 @@ LIMITE_UPLOAD="${LIMITE_UPLOAD:-25m}" TAG_RUNNER="${TAG_RUNNER:-$SISTEMA}"
 
 [ -n "$FONTES" ] || analisar_repositorio
 if [ "$VOLUMES_DEF" = 0 ]; then
-  if [ "${#DET_VOLUMES[@]}" -gt 0 ]; then VOLUMES=("${DET_VOLUMES[@]}"); else read -ra VOLUMES <<<"$STACK_VOLUMES_PADRAO"; fi
+  # Aplicação de monorepo: só as pastas que aparecem no código (sem o padrão da stack)
+  if [ "${#DET_VOLUMES[@]}" -gt 0 ]; then VOLUMES=("${DET_VOLUMES[@]}"); elif [ -z "$SO_APP" ]; then read -ra VOLUMES <<<"$STACK_VOLUMES_PADRAO"; fi
 fi
 # Caminhos relativos à raiz do repositório, sem ./ nem / no fim
 for i in "${!VOLUMES[@]}"; do
@@ -897,7 +1185,8 @@ done
 # Pipelines de deploy antigos (ex.: git pull + pm2 restart): sem desativá-los, cada push faria
 # dois deploys, o antigo e o novo
 if [ "$CI" = gitlab ]; then ARQ_CI=.gitlab-ci.yml; else ARQ_CI=.github/workflows/deploy.yml; fi
-detectar_pipeline_antigo
+CIS_ANTIGOS=() OBSOLETOS=()
+if [ -z "$SO_APP" ]; then detectar_pipeline_antigo; fi
 DESATIVAR=()
 if [ "${#CIS_ANTIGOS[@]}" -gt 0 ]; then
   if [ "$SUBSTITUIR_CI" = 1 ]; then
@@ -929,6 +1218,16 @@ if [ "$STACK_NEXTJS" = 1 ]; then
   fi
 fi
 
+# Monorepo com apps Next: force-dynamic nas páginas que consultam o banco, em todas de uma vez
+if [ "$MONO" = 1 ] && [ "$INTERATIVO" = 1 ] && [ "$FORCE_DYNAMIC" = 0 ]; then
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r _ _ st _ <<<"$a"
+    [[ "$st" == nextjs* ]] || continue
+    if sim_nao "Apps Next: acrescentar force-dynamic nas páginas que consultam o banco (o build não tem banco)?" s; then FORCE_DYNAMIC=1; fi
+    break
+  done
+fi
+
 # Validação com docker build no fim
 if [ -z "$CHECK_BUILD" ]; then
   CHECK_BUILD=0
@@ -954,6 +1253,9 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "$FORCE_DYNAMIC" = 1 ]; then cmd+=" --force-dynamic"; fi
   if [ -n "$MIGRATE_CMD" ]; then cmd+=" --migrate-cmd $(printf '%q' "$MIGRATE_CMD")"; fi
   if [ "$UPGRADE" = 1 ]; then cmd+=" --upgrade"; fi
+  for a in "${APPS_LIST[@]}"; do cmd+=" --app $a"; done
+  if [ -n "$MIGRATE_APP" ]; then cmd+=" --migrate-app $MIGRATE_APP"; fi
+  if [ -n "$START_CMD" ]; then cmd+=" --start-cmd $(printf '%q' "$START_CMD")"; fi
   if [ "$CHECK_BUILD" = 1 ]; then cmd+=" --check-build"; fi
   if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --no-volume"; fi
   for v in "${VOLUMES[@]}"; do cmd+=" --volume $v"; done
@@ -976,9 +1278,18 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "${#FORCE_PAGINAS[@]}" -gt 0 ]; then linha "Páginas" "${#FORCE_PAGINAS[@]} com force-dynamic"; fi
   if [ "$CHECK_BUILD" = 1 ]; then linha "Validação" "docker build no fim"; fi
   linha Stack "${STACK:-nenhuma}"
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    linha "App $nome" "$pasta  ${FRACO}$st · porta $porta · rota $rota$([ "$prefixo" = remove ] && echo " (sem o prefixo)") · saúde $saude$RESET"
+  done
+  if [ -n "$START_CMD" ]; then linha Início "$START_CMD"; fi
   if [ -n "$MIGRATE_CMD" ]; then linha Migração "$MIGRATE_CMD"; elif [ -f "$AQUI/examples/$STACK/compose.migrate.yml" ]; then linha Migração "da stack (compose.migrate.yml)"; fi
   if [ "$UPGRADE" = 1 ]; then linha Upgrade "arquivos gerados pelo zero-downtime-deploy são refeitos"; fi
-  linha Volumes "${VOLUMES[*]:-nenhum}  ${FRACO}(montados fora do contêiner)$RESET"
+  if [ "$MONO" = 1 ]; then
+    linha Volumes "${FRACO}detectados em cada aplicação, na geração$RESET"
+  else
+    linha Volumes "${VOLUMES[*]:-nenhum}  ${FRACO}(montados fora do contêiner)$RESET"
+  fi
   if [ "${#COPIAR[@]}" -gt 0 ]; then linha "Na imagem" "${COPIAR[*]}"; fi
   if [ "${#NEXT_PUBLIC[@]}" -gt 0 ]; then linha "Build args" "${NEXT_PUBLIC[*]}"; fi
   linha Upload "até $LIMITE_UPLOAD"
@@ -1084,10 +1395,32 @@ montar_blocos() {
   fi
   export BLOCO_VOLUMES BLOCO_CRIAR_PASTAS BLOCO_BUILD_ARGS BLOCO_BUILD_ARGS_DOCKERFILE BLOCO_CRIAR_PASTAS_DOCKERFILE \
     BLOCO_COPIAR_PASTAS BLOCO_HML_PORTA_80 BLOCO_TESTE_SCRIPT BLOCO_TESTE_PASSOS
+
+  # Serviços do compose: um só (app, na raiz) ou um por aplicação do monorepo
+  local a nome pasta st porta rota saude prefixo vol vb
+  if [ "$MONO" = 0 ]; then
+    BLOCO_SERVICOS="$(servico_compose app . "" "$PORTA_APP" "$HEALTH" "$BLOCO_VOLUMES" "")"
+  else
+    BLOCO_SERVICOS=""
+    for a in "${APPS_LIST[@]}"; do
+      IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+      vb=""
+      for vol in "${VOLUMES[@]}"; do
+        [[ "$vol" == "$pasta/"* ]] && vb+="${vb:+$NL}      - ./$vol:/app/${vol#"$pasta"/}"
+      done
+      if [ -n "$vb" ]; then vb="    volumes:$NL$vb"; else vb="    # Sem pastas montadas: o que esta aplicação gravar se perde no deploy"; fi
+      BLOCO_SERVICOS+="${BLOCO_SERVICOS:+$NL$NL}$(servico_compose "$nome" "./$pasta" "_$nome" "$porta" "$saude" "$vb" \
+        "    # A porta de cada aplicação: o .env é um só para todas${NL}    environment:${NL}      PORT: \"$porta\"")"
+    done
+  fi
+  BLOCO_LOCAIS_PROD="$(locais_nginx "" "{{PROD_NOME}}")"
+  BLOCO_LOCAIS_HML="$(locais_nginx hml_ "{{HML_NOME}}")"
+  export BLOCO_SERVICOS BLOCO_LOCAIS_PROD BLOCO_LOCAIS_HML
 }
 
 # Troca só os marcadores conhecidos: as expressões {{ ... }} do GitHub e do Docker ficam intactas
-preencher() {
+preencher() { preencher_blocos | preencher_valores; }
+preencher_blocos() {
   awk '{
     # Trechos só com homologação (COM_HML), só sem ela (SEM_HML, o "senão") e o fim deles
     if ($0 ~ /^[ \t]*# \{\{COM_HML\}\}[ \t]*$/) { pular = (ENVIRON["SEM_HML"] == "1"); next }
@@ -1100,7 +1433,10 @@ preencher() {
       next
     }
     print
-  }' | sed -e "s|{{SISTEMA}}|$SISTEMA|g" \
+  }'
+}
+preencher_valores() {
+  sed -e "s|{{SISTEMA}}|$SISTEMA|g" \
       -e "s|{{DOMINIO_PROD}}|$DOMINIO_PROD|g" \
       -e "s|{{DOMINIO_HML}}|$DOMINIO_HML|g" \
       -e "s|{{PORTA_APP}}|$PORTA_APP|g" \
@@ -1111,6 +1447,12 @@ preencher() {
       -e "s|{{HML_NOME}}|$HML_NOME|g" \
       -e "s|{{HML_BRANCH}}|$HML_BRANCH|g" \
       -e "s|{{BRANCHES}}|$BRANCHES|g" \
+      -e "s|{{START_CMD}}|$(sed -e 's/[\\&|]/\\&/g' <<<"$START_CMD")|g" \
+      -e "s|{{JAVA_VERSAO}}|$JAVA_VERSAO|g" \
+      -e "s|{{SAIDA_BUILD}}|$SAIDA_BUILD|g" \
+      -e "s|{{GO_VERSAO}}|$GO_VERSAO|g" \
+      -e "s|{{GO_MAIN}}|$GO_MAIN|g" \
+      -e "s|{{PHP_PUBLICO}}|$PHP_PUBLICO|g" \
       -e "s|{{LIMITE_UPLOAD}}|$LIMITE_UPLOAD|g" \
       -e "s|{{IP_PROD}}|${IP_PROD:+ $IP_PROD}|g" \
       -e "s|{{TAG_RUNNER}}|$TAG_RUNNER|g" \
@@ -1221,11 +1563,36 @@ gerar() {
   CRIADOS=$((CRIADOS + 1))
 }
 
+# Monorepo: cada aplicação passa pelo mesmo preparo de um sistema de uma pasta só (arquivos da
+# stack, pastas montadas, ajustes de Next.js, validação), com o resultado num arquivo
+if [ "$MONO" = 1 ]; then
+  VOLUMES=() NEXT_PUBLIC=() APPS_BUILD_OK=1
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    printf '%s%s App %s (%s, %s)%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$nome" "$pasta" "$st" "$RESET"
+    res="$(mktemp)"
+    filho=(--app-only "$res" --non-interactive --system "$SISTEMA" --prod-domain "$DOMINIO_PROD" --no-staging
+      --stack "$st" --app-port "$porta" --health "$saude")
+    if [ "$FORCE_DYNAMIC" = 1 ]; then filho+=(--force-dynamic); fi
+    if [ "$CHECK_BUILD" = 1 ]; then filho+=(--check-build); else filho+=(--no-check-build); fi
+    if [ "$UPGRADE" = 1 ]; then filho+=(--upgrade); fi
+    bash "$AQUI/scaffold.sh" "${filho[@]}" "$DESTINO/$pasta" 2>&1 | sed '/^$/d; s/^/  /'
+    for v in $(valor_conf "$res" VOLUMES); do VOLUMES+=("$pasta/$v"); done
+    for v in $(valor_conf "$res" BUILD_ARGS); do
+      printf '%s\n' "${NEXT_PUBLIC[@]}" | grep -qxF "$v" || NEXT_PUBLIC+=("$v")
+    done
+    if [ "$(valor_conf "$res" BUILD_OK)" = 0 ]; then APPS_BUILD_OK=0; fi
+    rm -f "$res"
+  done
+  echo
+fi
+
 montar_testes
 montar_blocos
 export SEM_HML
 if [ "$SEM_HML" = 1 ]; then BRANCHES="$PROD_BRANCH"; else BRANCHES="$PROD_BRANCH, $HML_BRANCH"; fi
 CRIADOS=0 MANTIDOS=0 ATUALIZADOS=0
+if [ -z "$SO_APP" ]; then
 printf '%s%s Gerando em %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$DESTINO" "$RESET"
 gerar deploy.sh deploy.sh
 chmod +x "$DESTINO/deploy.sh" 2>/dev/null || true
@@ -1239,6 +1606,37 @@ if [ "$CI" = gitlab ]; then
 else
   gerar github-deploy.yml .github/workflows/deploy.yml
 fi
+if [ "$MONO" = 1 ]; then gerar nginx/proxy-headers.inc nginx/proxy-headers.inc; fi
+
+# Monorepo: migração com o compose.migrate.yml da stack nextjs-prisma, apontado para a pasta da aplicação
+for a in "${APPS_LIST[@]}"; do
+  IFS=: read -r nome pasta st _ <<<"$a"
+  if [ "$nome" = "$MIGRATE_APP" ] && [ "$st" = nextjs-prisma ] && [ -z "$MIGRATE_CMD" ] && [ ! -e "$DESTINO/compose.migrate.yml" ]; then
+    sed "s#context: \.#context: ./$pasta#" "$AQUI/examples/nextjs-prisma/compose.migrate.yml" >"$DESTINO/compose.migrate.yml"
+    printf '  %s%s%s compose.migrate.yml (migração de %s)\n' "$VERDE" "$I_NOVO" "$RESET" "$pasta"
+    CRIADOS=$((CRIADOS + 1))
+  fi
+done
+
+# Monorepo: um .env.example na raiz juntando os das aplicações (o .env de cada pasta na VM é um só)
+if [ "$MONO" = 1 ] && [ ! -e "$DESTINO/.env.example" ]; then
+  {
+    echo "# Um .env por ambiente na VM, para todas as aplicações (o setup-host.sh cria a partir deste)."
+    echo "# Dono das pastas montadas como volume no servidor: o setup-host.sh grava id -u e id -g"
+    echo "APP_UID=1000"
+    echo "APP_GID=1000"
+    for a in "${APPS_LIST[@]}"; do
+      IFS=: read -r nome pasta _ <<<"$a"
+      [ -f "$DESTINO/$pasta/.env.example" ] || continue
+      echo
+      echo "# --- $pasta ---"
+      tr -d '\r' <"$DESTINO/$pasta/.env.example" | grep -vE '^(APP_UID|APP_GID|PORT)=' || true
+    done
+  } >"$DESTINO/.env.example"
+  printf '  %s%s%s .env.example (junta os das aplicações)\n' "$VERDE" "$I_NOVO" "$RESET"
+  CRIADOS=$((CRIADOS + 1))
+fi
+fi
 
 # Arquivos da stack: copiados como estão, sem sobrescrever
 if [ -n "$STACK" ]; then
@@ -1248,6 +1646,7 @@ if [ -n "$STACK" ]; then
     rel="${arquivo#"$ex"/}"
     case "$rel" in
       README.md | stack.conf) continue ;;
+      compose.migrate.yml) [ -z "$SO_APP" ] || continue ;;
       src/*)
         # Projeto sem src/ (app/ e lib/ na raiz): o Next ignoraria src/app, e a rota de saúde não existiria
         if [ ! -d "$DESTINO/src" ] && { [ -d "$DESTINO/app" ] || [ -d "$DESTINO/lib" ]; }; then rel="${rel#src/}"; fi
@@ -1283,13 +1682,15 @@ if [ "${#VOLUMES[@]}" -gt 0 ]; then
   printf '%s%s Pastas montadas%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
   for v in "${VOLUMES[@]}"; do
     garantir_ignorado .gitignore "/$v/"
-    garantir_ignorado .dockerignore "$v"
+    if [ "$MONO" = 0 ]; then garantir_ignorado .dockerignore "$v"; fi
   done
 fi
 
-printf '%s%s Configuração%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
-escrever_conf
-if [ -f "$DESTINO/.dockerignore" ]; then garantir_ignorado .dockerignore deploy.conf; fi
+if [ -z "$SO_APP" ]; then
+  printf '%s%s Configuração%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
+  escrever_conf
+  if [ -f "$DESTINO/.dockerignore" ]; then garantir_ignorado .dockerignore deploy.conf; fi
+fi
 
 printf '%s%s Código%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
 completar_env_example
@@ -1302,7 +1703,7 @@ fi
 
 # Validação: o Dockerfile compila? O next build pré-renderiza páginas, e no build não há banco
 BUILD_OK="" BUILD_LOG=""
-if [ "$CHECK_BUILD" = 1 ]; then
+if [ "$CHECK_BUILD" = 1 ] && [ "$MONO" = 0 ]; then
   printf '%s%s Validação%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
   if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
     printf '  %s%s Docker indisponível nesta máquina: a validação fica para o primeiro deploy%s\n' "$AMARELO" "$I_AVISO" "$RESET"
@@ -1353,7 +1754,24 @@ printf '%s%s %d arquivo(s) criado(s)%s%s\n' "$VERDE" "$I_OK" "$CRIADOS" "$RESET"
 echo
 printf '%s%s Falta fazer no repositório:%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
 item() { printf '  %s%s%s %s\n' "$AMARELO" "$I_ITEM" "$RESET" "$1"; }
-if [ -z "$STACK" ]; then
+if [ "$MONO" = 1 ]; then
+  item "revisar o que cada aplicação mostrou acima (arquivos da stack, rota de saúde, ajustes)"
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st porta rota saude prefixo <<<"$a"
+    if [ "$rota" != / ]; then
+      item "o front chama $nome por $rota no mesmo domínio (ex.: VITE_API_URL=/api ou NEXT_PUBLIC_API_URL=/api)$([ "$prefixo" = remove ] && echo "; o Nginx tira $rota antes de repassar")"
+    fi
+  done
+  if [ "$APPS_BUILD_OK" = 0 ]; then item "alguma imagem não compila: veja a validação de cada aplicação acima"; fi
+  for a in "${APPS_LIST[@]}"; do
+    IFS=: read -r nome pasta st _ <<<"$a"
+    [ -f "$DESTINO/$pasta/package.json" ] || continue
+    if ! ls "$DESTINO/$pasta"/package-lock.json "$DESTINO/$pasta"/yarn.lock "$DESTINO/$pasta"/pnpm-lock.yaml >/dev/null 2>&1 \
+      && ls "$DESTINO"/package-lock.json "$DESTINO"/yarn.lock "$DESTINO"/pnpm-lock.yaml >/dev/null 2>&1; then
+      item "$pasta não tem lock próprio (workspaces, lock na raiz): gere um nele (npm install --package-lock-only) ou ajuste o Dockerfile para compilar a partir da raiz"
+    fi
+  done
+elif [ -z "$STACK" ]; then
   item "Dockerfile, se ainda não houver (com WORKDIR /app: os volumes montam em /app/<pasta>)"
   item "a rota $HEALTH, respondendo 200 só com a aplicação pronta (e sem exigir login)"
   item "compose.migrate.yml, se o sistema tiver migração de banco (veja o README)"
@@ -1395,7 +1813,9 @@ outros_env="$(cd "$DESTINO" && ls -d .env.exemple .env.sample .env.dist example.
 if [ -n "$outros_env" ] && [ -f "$DESTINO/.env.example" ]; then
   item "apagar ${outros_env% }: o setup-host.sh usa o .env.example, deixe um modelo só"
 fi
-if [ "${#TESTE_CMDS[@]}" -gt 0 ]; then
+if [ -n "$SO_APP" ]; then
+  :
+elif [ "${#TESTE_CMDS[@]}" -gt 0 ]; then
   testes="$(printf '%s · ' "${TESTE_CMDS[@]}")"
   item "conferir o job test gerado (Node $TESTE_NODE): ${testes% · }"
 else
@@ -1428,13 +1848,16 @@ if [ "$STACK_NEXTJS" = 1 ]; then
 fi
 if [ "$BUILD_OK" = 0 ]; then
   item "a imagem não compila: corrija e valide com docker build (log em $BUILD_LOG)"
-elif [ "$CHECK_BUILD" != 1 ] && [ -f "$DESTINO/Dockerfile" ]; then
+elif [ "$CHECK_BUILD" != 1 ] && [ -f "$DESTINO/Dockerfile" ] && [ -z "$SO_APP" ]; then
   item "validar a imagem antes do push: docker build $( grep -qiE '^FROM .* AS runner' "$DESTINO/Dockerfile" && echo '--target runner ')."
 fi
-if [ "$CI" = gitlab ]; then
+if [ "$CI" = gitlab ] && [ -z "$SO_APP" ]; then
   item "o runner da VM precisa da tag $TAG_RUNNER (ou troque tags: no .gitlab-ci.yml)"
 fi
-if [ "$SEM_HML" = 1 ]; then
+if [ -n "$SO_APP" ]; then
+  # Modo interno: o resultado desta aplicação para o script da raiz
+  { echo "VOLUMES=\"${VOLUMES[*]}\""; echo "BUILD_ARGS=\"${NEXT_PUBLIC[*]}\""; echo "BUILD_OK=$BUILD_OK"; } >"$SO_APP"
+elif [ "$SEM_HML" = 1 ]; then
   item "commit e push na branch $PROD_BRANCH; depois, na VM: setup-host.sh com --no-staging"
 else
   item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"

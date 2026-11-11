@@ -2,6 +2,9 @@
 
 ## Não publicado
 
+- **Monorepo:** aplicações em subpastas (front e API) viram um sistema só, com um serviço por aplicação em cada cor, rotas por caminho no Nginx (`/api` → API, com o prefixo removido por padrão) e um `.env` único. `--app`, `--migrate-app` e `APPS`/`MIGRATE_APP` no `deploy.conf`. O `deploy.sh` espera todas as aplicações saudáveis antes de trocar.
+- **Stacks novas:** `node-prisma`, `python` (`--start-cmd`), `java-maven` e `static`. A detecção aceita alternativas (`requirements.txt:|pyproject.toml:`); sem `--stack`, a stack da raiz é detectada também sem perguntas.
+- **Health check** com `python3` e `php` como alternativas; porta do Dockerfile próprio lida do `EXPOSE` ou do `CMD`.
 - **`deploy.conf`:** as respostas do `scaffold.sh` ficam no repositório; rodando de novo, o que está nele não é perguntado. `--upgrade` refaz os arquivos de deploy (os com a marca do projeto) a partir dele.
 - **Stacks com detecção:** cada pasta de `examples/` tem um `stack.conf` com a regra de detecção e os padrões; o `scaffold.sh` sugere a mais específica. Novas: `nextjs` (sem Prisma), `node`, `spa` (Vite) e `dockerfile` (o do próprio sistema, para qualquer tecnologia).
 - **`--migrate-cmd`:** migração de qualquer ORM, rodada pelo `deploy.sh` na imagem nova antes da troca.

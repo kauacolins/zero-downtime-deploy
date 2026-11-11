@@ -45,13 +45,23 @@ done
 mkdir -p "$ATIVOS"
 ACTIVE="$ATIVOS/$ENV_NAME.inc"
 
+# Valor de uma chave do deploy.conf (sem executar nada)
+# (sem deploy.conf, vazio: com pipefail, o sed sem arquivo derrubaria o deploy)
+ler_conf() { { sed -n "s/^$1=//p" deploy.conf 2>/dev/null || true; } | tail -1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/" | tr -d '\r'; }
+
+# Serviços "nome:porta". Monorepo: um por app do APPS do deploy.conf ("nome:pasta:stack:porta:...");
+# sem APPS, um só, chamado app. Trocam de cor juntos: front e API sempre na mesma versão.
+SERVICOS=()
+for a in $(ler_conf APPS); do SERVICOS+=("$(cut -d: -f1 <<<"$a"):$(cut -d: -f4 <<<"$a")"); done
+[ "${#SERVICOS[@]}" -gt 0 ] || SERVICOS=("app:$PORTA_APP")
+
 color() {
   local name="$1"
   shift
   docker compose -p "$PROJECT-$name" -f "compose.$name.yml" "$@"
 }
 
-case "$(grep -oE '(blue|green)_app:' "$ACTIVE" 2>/dev/null | grep -oE 'blue|green' | head -1 || true)" in
+case "$(grep -oE '_(blue|green)_[A-Za-z0-9_-]+:' "$ACTIVE" 2>/dev/null | grep -oE 'blue|green' | head -1 || true)" in
   blue) CURRENT=blue; NEXT=green ;;
   green) CURRENT=green; NEXT=blue ;;
   *)
@@ -63,12 +73,15 @@ case "$(grep -oE '(blue|green)_app:' "$ACTIVE" 2>/dev/null | grep -oE 'blue|gree
     ;;
 esac
 
-NEXT_APP="${APP_PREFIX}${NEXT}_app"
 PREVIOUS=$(cat "$ACTIVE" 2>/dev/null || true)
 
 abort() {
+  local s
   echo "$1, abortando"
-  docker logs --tail 30 "$NEXT_APP" 2>/dev/null || true
+  for s in "${SERVICOS[@]}"; do
+    echo "--- ${APP_PREFIX}${NEXT}_${s%%:*}"
+    docker logs --tail 30 "${APP_PREFIX}${NEXT}_${s%%:*}" 2>/dev/null || true
+  done
   if [ -n "$PREVIOUS" ]; then echo "$PREVIOUS" > "$ACTIVE"; else rm -f "$ACTIVE"; fi
   color "$NEXT" down --remove-orphans
   exit 1
@@ -85,25 +98,36 @@ if [ -f compose.migrate.yml ]; then
   docker compose -p "$PROJECT-migrate" -f compose.migrate.yml run --rm --build migrate
 else
   # Sem compose.migrate.yml: o MIGRATE_CMD do deploy.conf roda na imagem nova, com o .env do ambiente
-  MIGRATE_CMD="$(sed -n 's/^MIGRATE_CMD=//p' deploy.conf 2>/dev/null | tail -1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/" | tr -d '\r')"
+  MIGRATE_CMD="$(ler_conf MIGRATE_CMD)"
   if [ -n "$MIGRATE_CMD" ]; then
     echo "[$ENV_NAME] Migração: $MIGRATE_CMD"
-    color "$NEXT" run --rm --no-deps -T app sh -c "$MIGRATE_CMD" </dev/null || abort "A migração falhou"
+    # Monorepo: roda no serviço MIGRATE_APP (ex.: a API); com um app só, no app
+    MIGRATE_APP="$(ler_conf MIGRATE_APP)"
+    color "$NEXT" run --rm --no-deps -T "${MIGRATE_APP:-${SERVICOS[0]%%:*}}" sh -c "$MIGRATE_CMD" </dev/null       || abort "A migração falhou"
   fi
 fi
 
 # {{CRIAR_PASTAS}}
 color "$NEXT" up -d
 
-STATUS=""
-for _ in $(seq 1 60); do
-  STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$NEXT_APP")
-  [ "$STATUS" = "healthy" ] || [ "$STATUS" = "unhealthy" ] && break
-  sleep 2
+# Todos os serviços da cor nova saudáveis, ou nada muda para o usuário
+for s in "${SERVICOS[@]}"; do
+  c="${APP_PREFIX}${NEXT}_${s%%:*}"
+  STATUS=""
+  for _ in $(seq 1 60); do
+    STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$c")
+    [ "$STATUS" = "healthy" ] || [ "$STATUS" = "unhealthy" ] && break
+    sleep 2
+  done
+  [ "$STATUS" = "healthy" ] || abort "$c não ficou saudável ($STATUS)"
 done
-[ "$STATUS" = "healthy" ] || abort "$NEXT_APP não ficou saudável ($STATUS)"
 
-echo "set \$app_upstream ${NEXT_APP}:${PORTA_APP};" > "$ACTIVE"
+# Destino do Nginx: um app só usa $app_upstream; monorepo, um $up_<nome> por serviço
+if [ "${#SERVICOS[@]}" = 1 ] && [ "${SERVICOS[0]%%:*}" = app ]; then
+  echo "set \$app_upstream ${APP_PREFIX}${NEXT}_app:${SERVICOS[0]#*:};" > "$ACTIVE"
+else
+  for s in "${SERVICOS[@]}"; do echo "set \$up_${s%%:*} ${APP_PREFIX}${NEXT}_${s%%:*}:${s#*:};"; done > "$ACTIVE"
+fi
 
 if [ "$(docker inspect -f '{{.State.Running}}' nginx 2>/dev/null)" = "true" ]; then
   { docker exec nginx nginx -t && docker exec nginx nginx -s reload; } || abort "Falha ao aplicar a configuração do Nginx"
@@ -117,4 +141,4 @@ if [ -n "$CURRENT" ]; then
   color "$CURRENT" down --remove-orphans
 fi
 
-echo "[$ENV_NAME] Deploy concluído: $NEXT_APP ativo"
+echo "[$ENV_NAME] Deploy concluído: cor $NEXT ativa (${SERVICOS[*]%%:*})"

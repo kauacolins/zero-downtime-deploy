@@ -6,9 +6,14 @@ WORKDIR /app
 
 # Todas as dependências: usadas no build e nas migrações (o Prisma CLI é dev dependency)
 FROM base AS deps
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* ./
 COPY prisma ./prisma
-RUN npm ci --ignore-scripts && npx prisma generate
+# Instala pelo lock que o projeto tiver (npm, yarn ou pnpm); sem lock, npm install
+RUN if [ -f package-lock.json ]; then npm ci --ignore-scripts; \
+    elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile --ignore-scripts; \
+    elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile --ignore-scripts; \
+    else npm install --ignore-scripts; fi \
+  && npx prisma generate
 
 # Migrações: docker compose run --rm migrate
 FROM deps AS migrate

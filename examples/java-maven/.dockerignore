@@ -1,0 +1,13 @@
+.git
+target
+.idea
+*.iml
+.env
+.env.*
+Dockerfile
+compose.*.yml
+deploy.sh
+deploy.conf
+.github
+.gitlab-ci.yml
+nginx
