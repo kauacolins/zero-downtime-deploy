@@ -24,6 +24,17 @@ push na main ─► runner na VM ─► /opt/<sistema>/production ─► bash de
 push na dev  ─► runner na VM ─► /opt/<sistema>/developer  ─► bash deploy.sh developer
 ```
 
+### Só produção
+
+Sem ambiente de homologação, use `--sem-homologacao` nos dois scripts (no modo interativo, é a pergunta "Ambientes"). O `scaffold.sh` gera o Nginx só com a produção na porta 80, sem a porta 3001, e o CI publica só pela branch de produção. O `setup-host.sh` clona, configura e publica só a produção, não cria banco de homologação e só olha a porta 80. O resto (blue-green, health check, migração) é igual.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh) --sem-homologacao
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh) --sem-homologacao
+```
+
+Se a VM for preparada com homologação para um repositório gerado sem ela, o `setup-host.sh` avisa.
+
 O `deploy.sh` de cada sistema faz, nesta ordem:
 
 1. Confere se a pasta e o banco do `.env` são do ambiente certo (o de homologação termina em `_hml`).

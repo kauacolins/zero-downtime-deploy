@@ -1,4 +1,8 @@
+# {{COM_HML}}
 # Push na {{HML_BRANCH}} publica em homologação; push na {{PROD_BRANCH}}, em produção.
+# {{SEM_HML}}
+# Push na {{PROD_BRANCH}} publica em produção (sem homologação).
+# {{FIM}}
 # Gerado pelo zero-downtime-deploy (modelos/gitlab-ci.yml). Inclua os testes do sistema no job test.
 stages: [test, deploy]
 
@@ -7,7 +11,11 @@ stages: [test, deploy]
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # {{COM_HML}}
     - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}" || $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
+    # {{SEM_HML}}
+    - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}"
+    # {{FIM}}
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_BRANCH
@@ -18,7 +26,11 @@ test:
   image: {{TESTE_IMAGEM}}
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # {{COM_HML}}
     - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}" || $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
+    # {{SEM_HML}}
+    - if: $CI_COMMIT_BRANCH == "{{PROD_BRANCH}}"
+    # {{FIM}}
   script:
     # {{TESTE_SCRIPT}}
 
@@ -34,6 +46,7 @@ test:
 
 # Um job por ambiente: o resource_group fixo garante um deploy por vez em cada um.
 # GIT_STRATEGY none: não clona, atualiza a pasta do ambiente em /opt.
+# {{COM_HML}}
 deploy_{{HML_NOME}}:
   extends: .deploy
   resource_group: {{HML_NOME}}
@@ -41,6 +54,7 @@ deploy_{{HML_NOME}}:
   rules:
     - if: $CI_COMMIT_BRANCH == "{{HML_BRANCH}}"
 
+# {{FIM}}
 deploy_{{PROD_NOME}}:
   extends: .deploy
   resource_group: {{PROD_NOME}}

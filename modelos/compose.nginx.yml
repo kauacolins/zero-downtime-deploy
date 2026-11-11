@@ -9,8 +9,10 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      # {{COM_HML}}
       # Homologação
       - "{{PORTA_HML}}:{{PORTA_HML}}"
+      # {{FIM}}
     # Pastas inteiras, para o Nginx enxergar os arquivos regravados pelo Git e pelo deploy.sh
     volumes:
       - /opt/{{SISTEMA}}/{{PROD_NOME}}/nginx:/etc/nginx/conf.d:ro

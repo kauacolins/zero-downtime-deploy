@@ -25,7 +25,9 @@ Copia os modelos para a raiz do repositório de um sistema (rode na sua máquina
 Opções:
   --sistema NOME              obrigatório; o mesmo usado no setup-host.sh
   --dominio-prod DOMINIO      obrigatório
-  --dominio-hml DOMINIO       obrigatório
+  --dominio-hml DOMINIO       obrigatório, a não ser com --sem-homologacao
+  --sem-homologacao           só produção: sem o ambiente de homologação (nem porta 3001, nem
+                              branch, nem job de deploy dele)
   --porta-app PORTA           porta da aplicação dentro do contêiner (padrão: 3000)
   --health CAMINHO            rota que responde 200 com a aplicação saudável (padrão: /api/health)
   --porta-hml PORTA           porta de homologação na VM (padrão: 3001)
@@ -73,6 +75,7 @@ AJUDA
 # Vazios até o fim da leitura: o modo interativo só pergunta o que não veio
 SISTEMA="" DOMINIO_PROD="" DOMINIO_HML="" PORTA_APP="" HEALTH="" PORTA_HML=""
 PROD_NOME="" PROD_BRANCH="" HML_NOME="" HML_BRANCH="" CI="" STACK="" STACK_DEFINIDA=0 DESTINO=""
+SEM_HML=0 SEM_HML_DEF=0
 INTERATIVO=auto SUBSTITUIR_CI=0
 VOLUMES=() VOLUMES_DEF=0 COPIAR=() COPIAR_DEF=0 LIMITE_UPLOAD="" IP_PROD="" TAG_RUNNER=""
 
@@ -88,6 +91,7 @@ while [ $# -gt 0 ]; do
     --prod-branch) PROD_BRANCH="$2"; shift 2 ;;
     --hml-nome) HML_NOME="$2"; shift 2 ;;
     --hml-branch) HML_BRANCH="$2"; shift 2 ;;
+    --sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
     --ci) CI="$2"; shift 2 ;;
     --stack) STACK="$2"; STACK_DEFINIDA=1; shift 2 ;;
     --substituir-ci) SUBSTITUIR_CI=1; shift ;;
@@ -381,7 +385,7 @@ todas_marcadas() {
 
 # Faltou algo obrigatório e há terminal: pergunta em vez de parar
 if [ "$INTERATIVO" = auto ]; then
-  if { [ -z "$SISTEMA" ] || [ -z "$DOMINIO_PROD" ] || [ -z "$DOMINIO_HML" ] || [ -z "$DESTINO" ]; } \
+  if { [ -z "$SISTEMA" ] || [ -z "$DOMINIO_PROD" ] || { [ -z "$DOMINIO_HML" ] && [ "$SEM_HML" = 0 ]; } || [ -z "$DESTINO" ]; } \
     && { : </dev/tty; } 2>/dev/null; then
     INTERATIVO=1
   else
@@ -445,10 +449,18 @@ if [ "$INTERATIVO" = 1 ]; then
     perguntar TAG_RUNNER "Tag do runner da VM (se ela já tem um runner registrado, use a tag dele)" "$SISTEMA" '^[A-Za-z0-9_.-]+$'
   fi
 
+  if [ "$SEM_HML_DEF" = 0 ] && [ -z "$HML_BRANCH" ] && [ -z "$DOMINIO_HML" ]; then
+    escolher ambientes "Ambientes" 1 \
+      "ambos|produção e homologação (homologação na porta 3001 da mesma VM, com banco próprio)" \
+      "prod|só produção"
+    if [ "$ambientes" = prod ]; then SEM_HML=1; fi
+    SEM_HML_DEF=1
+  fi
+
   if [ -z "$PROD_BRANCH" ]; then
     escolher_branch PROD_BRANCH "Branch de produção" "$branches" main main master production prod
   fi
-  if [ -z "$HML_BRANCH" ]; then
+  if [ -z "$HML_BRANCH" ] && [ "$SEM_HML" = 0 ]; then
     escolher_branch HML_BRANCH "Branch de homologação" "$branches" dev dev develop developer homolog homologacao staging hml
     if ! grep -qx "$HML_BRANCH" <<<"$branches"; then
       echo "    A branch $HML_BRANCH ainda não existe: crie-a a partir de $PROD_BRANCH (git checkout -b $HML_BRANCH)."
@@ -458,7 +470,7 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ -z "$DOMINIO_PROD" ]; then
     perguntar DOMINIO_PROD "Domínio de produção" "$SISTEMA.saoluis.ma.gov.br" '^[A-Za-z0-9.-]+$'
   fi
-  if [ -z "$DOMINIO_HML" ]; then
+  if [ -z "$DOMINIO_HML" ] && [ "$SEM_HML" = 0 ]; then
     escolher tipo "Endereço de homologação (a porta ${PORTA_HML:-3001} da VM sempre atende homologação)" 1 \
       "dominio|domínio próprio (ex.: hml-$DOMINIO_PROD)" \
       "ip|só o IP da VM (http://IP:${PORTA_HML:-3001})"
@@ -522,10 +534,10 @@ if [ "$INTERATIVO" = 1 ]; then
   if sim_nao "Ajustar portas, rota de saúde, limite de upload ou nomes dos ambientes? (padrões: 3000, /api/health, 3001, 25m, production, developer)" n; then
     perguntar PORTA_APP "Porta da aplicação dentro do contêiner" "${PORTA_APP:-3000}" '^[0-9]+$'
     perguntar HEALTH "Rota de saúde (200 só com a aplicação pronta, sem login)" "${HEALTH:-/api/health}" '^/'
-    perguntar PORTA_HML "Porta de homologação na VM" "${PORTA_HML:-3001}" '^[0-9]+$'
+    if [ "$SEM_HML" = 0 ]; then perguntar PORTA_HML "Porta de homologação na VM" "${PORTA_HML:-3001}" '^[0-9]+$'; fi
     perguntar LIMITE_UPLOAD "Maior envio aceito pelo Nginx (um pouco acima do limite da aplicação)" "${LIMITE_UPLOAD:-25m}" '^[0-9]+[kKmMgG]?$'
     perguntar PROD_NOME "Nome do ambiente de produção (pasta na VM)" "${PROD_NOME:-production}" '^[a-z0-9_-]+$'
-    perguntar HML_NOME "Nome do ambiente de homologação (pasta na VM)" "${HML_NOME:-developer}" '^[a-z0-9_-]+$'
+    if [ "$SEM_HML" = 0 ]; then perguntar HML_NOME "Nome do ambiente de homologação (pasta na VM)" "${HML_NOME:-developer}" '^[a-z0-9_-]+$'; fi
   fi
 fi
 
@@ -533,7 +545,7 @@ PORTA_APP="${PORTA_APP:-3000}" HEALTH="${HEALTH:-/api/health}" PORTA_HML="${PORT
 PROD_NOME="${PROD_NOME:-production}" PROD_BRANCH="${PROD_BRANCH:-main}"
 HML_NOME="${HML_NOME:-developer}" HML_BRANCH="${HML_BRANCH:-dev}" CI="${CI:-github}"
 
-[ -n "$SISTEMA" ] && [ -n "$DOMINIO_PROD" ] && [ -n "$DOMINIO_HML" ] && [ -n "$DESTINO" ] || uso 1
+[ -n "$SISTEMA" ] && [ -n "$DOMINIO_PROD" ] && { [ -n "$DOMINIO_HML" ] || [ "$SEM_HML" = 1 ]; } && [ -n "$DESTINO" ] || uso 1
 [[ "$SISTEMA" =~ ^[a-z0-9_]+$ ]] || { echo "--sistema aceita só minúsculas, números e _ (vira nome de contêiner)" >&2; exit 1; }
 [[ "$CI" =~ ^(github|gitlab)$ ]] || { echo "--ci aceita github ou gitlab" >&2; exit 1; }
 [ -d "$DESTINO" ] || { echo "Pasta não encontrada: $DESTINO" >&2; exit 1; }
@@ -575,14 +587,18 @@ if [ -f "$DESTINO/$ARQ_CI" ] && ! grep -q zero-downtime-deploy "$DESTINO/$ARQ_CI
 fi
 
 if [ "$INTERATIVO" = 1 ]; then
-  cmd="$CHAMADA --sistema $SISTEMA --dominio-prod $DOMINIO_PROD --dominio-hml $DOMINIO_HML"
-  cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH --ci $CI"
+  cmd="$CHAMADA --sistema $SISTEMA --dominio-prod $DOMINIO_PROD"
+  if [ "$SEM_HML" = 1 ]; then
+    cmd+=" --sem-homologacao --prod-branch $PROD_BRANCH --ci $CI"
+  else
+    cmd+=" --dominio-hml $DOMINIO_HML --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH --ci $CI"
+  fi
   if [ -n "$STACK" ]; then cmd+=" --stack $STACK"; fi
   if [ "$PORTA_APP" != 3000 ]; then cmd+=" --porta-app $PORTA_APP"; fi
   if [ "$HEALTH" != /api/health ]; then cmd+=" --health $HEALTH"; fi
-  if [ "$PORTA_HML" != 3001 ]; then cmd+=" --porta-hml $PORTA_HML"; fi
+  if [ "$PORTA_HML" != 3001 ] && [ "$SEM_HML" = 0 ]; then cmd+=" --porta-hml $PORTA_HML"; fi
   if [ "$PROD_NOME" != production ]; then cmd+=" --prod-nome $PROD_NOME"; fi
-  if [ "$HML_NOME" != developer ]; then cmd+=" --hml-nome $HML_NOME"; fi
+  if [ "$HML_NOME" != developer ] && [ "$SEM_HML" = 0 ]; then cmd+=" --hml-nome $HML_NOME"; fi
   if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --substituir-ci"; fi
   if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --sem-volume"; fi
   for v in "${VOLUMES[@]}"; do cmd+=" --volume $v"; done
@@ -596,7 +612,11 @@ if [ "$INTERATIVO" = 1 ]; then
   linha Repositório "${DESTINO/#$HOME/\~}"
   linha Sistema "$SISTEMA"
   linha Produção "$DOMINIO_PROD  ${FRACO}branch $PROD_BRANCH$RESET"
-  linha Homologação "$DOMINIO_HML  ${FRACO}porta $PORTA_HML na VM · branch $HML_BRANCH$RESET"
+  if [ "$SEM_HML" = 1 ]; then
+    linha Homologação "${FRACO}não usa (só produção)$RESET"
+  else
+    linha Homologação "$DOMINIO_HML  ${FRACO}porta $PORTA_HML na VM · branch $HML_BRANCH$RESET"
+  fi
   linha CI "$CI$([ "$SUBSTITUIR_CI" = 1 ] && echo "  ${FRACO}(o atual vai para .bak)$RESET")"
   linha Stack "${STACK:-nenhuma}"
   linha Volumes "${VOLUMES[*]:-nenhum}  ${FRACO}(montados fora do contêiner)$RESET"
@@ -706,6 +726,11 @@ montar_blocos() {
 # Troca só os marcadores conhecidos: as expressões {{ ... }} do GitHub e do Docker ficam intactas
 preencher() {
   awk '{
+    # Trechos só com homologação (COM_HML), só sem ela (SEM_HML, o "senão") e o fim deles
+    if ($0 ~ /^[ \t]*# \{\{COM_HML\}\}[ \t]*$/) { pular = (ENVIRON["SEM_HML"] == "1"); next }
+    if ($0 ~ /^[ \t]*# \{\{SEM_HML\}\}[ \t]*$/) { pular = (ENVIRON["SEM_HML"] != "1"); next }
+    if ($0 ~ /^[ \t]*# \{\{FIM\}\}[ \t]*$/) { pular = 0; next }
+    if (pular) next
     if (match($0, /# \{\{[A-Z_0-9]+\}\}/) && substr($0, 1, RSTART - 1) ~ /^[ \t]*$/) {
       v = ENVIRON["BLOCO_" substr($0, RSTART + 4, RLENGTH - 6)]
       if (v != "") print v
@@ -722,6 +747,7 @@ preencher() {
       -e "s|{{PROD_BRANCH}}|$PROD_BRANCH|g" \
       -e "s|{{HML_NOME}}|$HML_NOME|g" \
       -e "s|{{HML_BRANCH}}|$HML_BRANCH|g" \
+      -e "s|{{BRANCHES}}|$BRANCHES|g" \
       -e "s|{{LIMITE_UPLOAD}}|$LIMITE_UPLOAD|g" \
       -e "s|{{IP_PROD}}|${IP_PROD:+ $IP_PROD}|g" \
       -e "s|{{TAG_RUNNER}}|$TAG_RUNNER|g" \
@@ -812,6 +838,8 @@ gerar() {
 
 montar_testes
 montar_blocos
+export SEM_HML
+if [ "$SEM_HML" = 1 ]; then BRANCHES="$PROD_BRANCH"; else BRANCHES="$PROD_BRANCH, $HML_BRANCH"; fi
 CRIADOS=0 MANTIDOS=0
 printf '%s%s Gerando em %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$DESTINO" "$RESET"
 gerar deploy.sh deploy.sh
@@ -899,8 +927,11 @@ if [ "$NEXT_STANDALONE" = falta ]; then
 fi
 # Server Actions recusam pedidos de origem que não esteja em allowedOrigins: confere uma por uma
 if [[ "$STACK" == nextjs* ]] && tem_no_codigo "${Q}use server$Q"; then
-  necessarias=("$DOMINIO_PROD" "$DOMINIO_HML:$PORTA_HML")
-  [[ "$DOMINIO_HML" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || necessarias+=("$DOMINIO_HML")
+  necessarias=("$DOMINIO_PROD")
+  if [ "$SEM_HML" = 0 ]; then
+    necessarias+=("$DOMINIO_HML:$PORTA_HML")
+    [[ "$DOMINIO_HML" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || necessarias+=("$DOMINIO_HML")
+  fi
   if [ -n "$IP_PROD" ]; then necessarias+=("$IP_PROD"); fi
   faltam=""
   for o in "${necessarias[@]}"; do
@@ -934,5 +965,9 @@ fi
 if [ "$CI" = gitlab ]; then
   item "o runner da VM precisa da tag $TAG_RUNNER (ou troque tags: no .gitlab-ci.yml)"
 fi
-item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"
+if [ "$SEM_HML" = 1 ]; then
+  item "commit e push na branch $PROD_BRANCH; depois, na VM: setup-host.sh com --sem-homologacao"
+else
+  item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"
+fi
 }

@@ -16,6 +16,8 @@ SISTEMA="" PROD_NOME=production PROD_BRANCH="" HML_NOME=developer HML_BRANCH=""
 SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY="" SIM=0 INTERATIVO=auto
 REPOS=() PG_ACESSOS=() ENV_TODOS=() ENV_PROD=() ENV_HML=()
 SEGREDOS_PERGUNTADO=0 RETOMADO=0 ESTADO_ATIVO=0
+# Só produção (--sem-homologacao): sem clone, .env, banco nem deploy de homologação
+SEM_HML=0 SEM_HML_DEF=0
 # Instalação atual de cada repositório (deploy antigo): "DONO/REPO=/pasta" ou só "/pasta"
 ORIGENS=()
 
@@ -51,6 +53,8 @@ Rode com o usuário do deploy (não como root), que precisa de sudo. Exemplos:
 
 Opções:
   --sistema NOME          obrigatório; as pastas ficam em /opt/NOME
+  --sem-homologacao       só produção (o repositório gerado com scaffold.sh --sem-homologacao):
+                          sem clone, .env, banco nem deploy de homologação, e só a porta 80
   --repo DONO/REPO[:PASTA[:LABELS]]
                           repetível. PASTA é a subpasta em /opt/NOME (padrão: nenhuma com
                           um repositório, o nome do repositório com vários). LABELS são as
@@ -110,6 +114,7 @@ while [ $# -gt 0 ]; do
     --prod-branch) PROD_BRANCH="$2"; shift 2 ;;
     --hml-nome) HML_NOME="$2"; shift 2 ;;
     --hml-branch) HML_BRANCH="$2"; shift 2 ;;
+    --sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
     --segredos) SEGREDOS="$2"; shift 2 ;;
     --env) ENV_TODOS+=("$2"); shift 2 ;;
     --env-prod) ENV_PROD+=("$2"); shift 2 ;;
@@ -403,7 +408,14 @@ ATUAL_NGINX_SOLTO=0   # nginx fora do systemd nas portas
 ATUAL_CONTEINERES=()  # contêineres de outros sistemas nas portas 80/3001
 REVERTER=()           # comandos que religam o que foi parado, na ordem em que foi parado
 
-portas_ocupadas() { sudo ss -ltnpH '( sport = :80 or sport = :3001 )' | grep -v docker-proxy || true; }
+# Portas que o Nginx deste sistema publica: 80, e 3001 com homologação (definir_portas)
+PORTAS_SS='( sport = :80 or sport = :3001 )' PORTAS_RE=':(80|3001)$' PORTAS_TXT="80 e 3001"
+definir_portas() {
+  if [ "$SEM_HML" = 1 ]; then
+    PORTAS_SS='( sport = :80 )' PORTAS_RE=':80$' PORTAS_TXT="80"
+  fi
+}
+portas_ocupadas() { sudo ss -ltnpH "$PORTAS_SS" | grep -v docker-proxy || true; }
 
 pm2_como() {
   local dono="$1" home="$2" node_bin="$3" pm2_bin="$4"
@@ -452,16 +464,16 @@ detectar_sistema_atual() {
   fi
   if [ "$ATUAL_NGINX_HOST" = 0 ] && portas_ocupadas | grep -q '"nginx"'; then
     ATUAL_NGINX_SOLTO=1
-    echo "    Há um processo nginx fora do systemd nas portas 80/3001."
+    echo "    Há um processo nginx fora do systemd na(s) porta(s) $PORTAS_TXT."
   fi
 
   for c in $("${DOCKER[@]}" ps --format '{{.Names}}'); do
-    portas="$("${DOCKER[@]}" port "$c" 2>/dev/null | grep -E ':(80|3001)$' || true)"
+    portas="$("${DOCKER[@]}" port "$c" 2>/dev/null | grep -E "$PORTAS_RE" || true)"
     [ -n "$portas" ] || continue
     d="$("${DOCKER[@]}" inspect "$c" -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
     if [[ -n "$d" && "$d" == "$BASE"* ]]; then ok "Contêiner $c já é deste sistema"; continue; fi
     ATUAL_CONTEINERES+=("$c")
-    echo "    O contêiner $c ($("${DOCKER[@]}" inspect "$c" -f '{{.Config.Image}}'), de ${d:-origem desconhecida}) ocupa a porta 80 ou 3001."
+    echo "    O contêiner $c ($("${DOCKER[@]}" inspect "$c" -f '{{.Config.Image}}'), de ${d:-origem desconhecida}) ocupa a(s) porta(s) $PORTAS_TXT."
   done
 
   # Um contêiner parado chamado nginx impediria o deploy de criar o deste sistema com o mesmo nome
@@ -652,7 +664,7 @@ salvar_estado() {
   arq="$ESTADO_DIR/setup-host.$SISTEMA.estado"
   {
     echo "# setup-host.sh: respostas e situação da última execução de $SISTEMA. Pode apagar."
-    declare -p FORGE GIT_HOST FORGE_DEFINIDO SISTEMA PROD_NOME PROD_BRANCH HML_NOME HML_BRANCH \
+    declare -p FORGE GIT_HOST FORGE_DEFINIDO SISTEMA PROD_NOME PROD_BRANCH HML_NOME HML_BRANCH SEM_HML \
       SEGREDOS SEGREDOS_PERGUNTADO PG_HML CLONAR DEPLOY REPOS PG_ACESSOS ENV_TODOS ENV_PROD ENV_HML ORIGENS
     printf 'ESTADO_DATA=%q\nESTADO_ETAPA=%q\nESTADO_FIM=%q\n' "$(date '+%d/%m/%Y %H:%M')" "$ETAPA_ATUAL" "$1"
     declare -p PENDENCIAS | sed 's/ PENDENCIAS=/ ESTADO_PENDENCIAS=/'
@@ -767,10 +779,18 @@ if [ "$INTERATIVO" = 1 ]; then
     branches="$(gh_api GET "repos/${REPOS[0]%%:*}/branches?per_page=100" 2>/dev/null \
       | grep -oE '"name": *"[^"]+"' | cut -d'"' -f4 || true)"
   fi
+  if [ "$SEM_HML_DEF" = 0 ] && [ "$RETOMADO" = 0 ] && [ -z "$HML_BRANCH" ] && [ -z "$PG_HML" ]; then
+    escolher ambientes "Ambientes (o mesmo escolhido no scaffold.sh)" 1 \
+      "ambos|produção e homologação (homologação na porta 3001, com banco próprio)" \
+      "prod|só produção"
+    if [ "$ambientes" = prod ]; then SEM_HML=1; fi
+    SEM_HML_DEF=1
+  fi
+
   if [ -z "$PROD_BRANCH" ]; then
     escolher_branch PROD_BRANCH "Branch de produção" "$branches" main main master production prod
   fi
-  if [ -z "$HML_BRANCH" ]; then
+  if [ -z "$HML_BRANCH" ] && [ "$SEM_HML" = 0 ]; then
     escolher_branch HML_BRANCH "Branch de homologação" "$branches" dev \
       dev develop developer homolog homologacao staging hml
     if [ -n "$branches" ] && ! grep -qx "$HML_BRANCH" <<<"$branches"; then
@@ -798,7 +818,7 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   # PostgreSQL da máquina: banco de homologação e acesso da rede Docker aos bancos de produção
-  if [ -d /etc/postgresql ] && [ -z "$PG_HML" ] && [ "$RETOMADO" = 0 ]; then
+  if [ -d /etc/postgresql ] && [ -z "$PG_HML" ] && [ "$RETOMADO" = 0 ] && [ "$SEM_HML" = 0 ]; then
     hml_sugerido="$(tr '-' '_' <<<"$SISTEMA")_hml"
     escolher PG_HML "Banco de homologação no PostgreSQL da máquina" 1 \
       "$hml_sugerido|criar $hml_sugerido (banco e usuário novos, vazios)" \
@@ -815,7 +835,11 @@ if [ "$INTERATIVO" = 1 ]; then
   cmd="$CHAMADA --sistema $SISTEMA"
   [ "$FORGE" = gitlab ] && cmd+=" --gitlab $GIT_HOST"
   for r in "${REPOS[@]}"; do cmd+=" --repo $r"; done
-  cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
+  if [ "$SEM_HML" = 1 ]; then
+    cmd+=" --sem-homologacao --prod-branch $PROD_BRANCH"
+  else
+    cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
+  fi
   [ -n "$PG_HML" ] && cmd+=" --pg-hml $PG_HML"
   for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-acesso $a"; done
   for a in "${ORIGENS[@]}"; do cmd+=" --origem $a"; done
@@ -827,6 +851,15 @@ fi
 trap 'printf "\n\n  %s%s Interrompido em \"%s\". Rode o mesmo comando de novo para continuar.%s\n" "$AMARELO" "$I_AVISO" "$ETAPA_ATUAL" "$RESET" >&2; exit 130' INT
 
 PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
+# Ambientes em uso: AMBIENTES na ordem de preparar, ORDEM_DEPLOY com homologação primeiro
+if [ "$SEM_HML" = 1 ]; then
+  [ -z "$PG_HML" ] || falha "--pg-hml não combina com --sem-homologacao"
+  AMBIENTES=("$PROD_NOME") ORDEM_DEPLOY=("$PROD_NOME") CLONES=("$PROD_NOME:$PROD_BRANCH")
+else
+  AMBIENTES=("$PROD_NOME" "$HML_NOME") ORDEM_DEPLOY=("$HML_NOME" "$PROD_NOME")
+  CLONES=("$PROD_NOME:$PROD_BRANCH" "$HML_NOME:$HML_BRANCH")
+fi
+definir_portas
 [[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
 BASE="/opt/$SISTEMA"
 for a in "${ORIGENS[@]}"; do
@@ -867,7 +900,7 @@ ok "Rede docker web (compartilhada pelos sistemas da VM)"
 etapa "Sistema atual"
 detectar_sistema_atual
 if ! tem_sistema_atual; then
-  ok "Portas 80 e 3001 livres e nenhum processo no PM2"
+  ok "Porta(s) $PORTAS_TXT livre(s) e nenhum processo no PM2"
 elif [ "$DEPLOY" = 1 ]; then
   ok "Fica no ar até o primeiro deploy, no fim desta execução: as imagens novas são compiladas antes"
 else
@@ -953,7 +986,7 @@ if [ "$CLONAR" = 1 ]; then
       fi
     fi
 
-    for par in "$PROD_NOME:$PROD_BRANCH" "$HML_NOME:$HML_BRANCH"; do
+    for par in "${CLONES[@]}"; do
       amb="${par%%:*}" branch="${par#*:}"
       dest="$RAIZ/$amb"
       mkdir -p "$RAIZ"
@@ -975,7 +1008,7 @@ etapa "Arquivos de deploy nos repositórios"
 # O script prepara a VM; o deploy em si depende destes arquivos, que ficam no repositório
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
-  for amb in "$PROD_NOME" "$HML_NOME"; do
+  for amb in "${AMBIENTES[@]}"; do
     dest="$RAIZ/$amb"
     [ -d "$dest/.git" ] || continue
     faltam=()
@@ -987,6 +1020,9 @@ for spec in "${REPOS[@]}"; do
       [ -f "$dest/.gitlab-ci.yml" ] || faltam+=(".gitlab-ci.yml")
     else
       grep -qslE 'self-hosted' "$dest"/.github/workflows/*.y*ml || faltam+=("workflow com runs-on: self-hosted")
+    fi
+    if [ "$SEM_HML" = 0 ] && [ -f "$dest/nginx/default.conf" ] && ! grep -q '_hml_blue_app' "$dest/nginx/default.conf"; then
+      aviso "$SLUG ($amb): o repositório foi gerado sem homologação (scaffold.sh --sem-homologacao): rode este script com --sem-homologacao"
     fi
     if [ "${#faltam[@]}" -eq 0 ]; then
       ok "$SLUG ($amb): arquivos de deploy presentes"
@@ -1023,7 +1059,7 @@ if [ -z "$PG_URL" ] && [ -n "$PG_HML" ] && [ -f "$BASE/$PG_HML.url" ]; then
 fi
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
-  for amb in "$PROD_NOME" "$HML_NOME"; do
+  for amb in "${AMBIENTES[@]}"; do
     dest="$RAIZ/$amb"
     [ -d "$dest" ] || continue
 
@@ -1206,7 +1242,7 @@ if [ -d /etc/postgresql ]; then
   acessos=("${PG_ACESSOS[@]}")
   for spec in "${REPOS[@]}"; do
     ler_repo "$spec"
-    for amb in "$PROD_NOME" "$HML_NOME"; do
+    for amb in "${AMBIENTES[@]}"; do
       env="$RAIZ/$amb/.env"
       [ -f "$env" ] || continue
       for chave in DATABASE_URL DIRECT_URL; do
@@ -1358,7 +1394,7 @@ if [ "$DEPLOY" = 1 ]; then
   else
     # 1. Imagens compiladas com o sistema atual ainda no ar
     seguir=1
-    for amb in "$HML_NOME" "$PROD_NOME"; do
+    for amb in "${ORDEM_DEPLOY[@]}"; do
       for spec in "${REPOS[@]}"; do
         ler_repo "$spec"
         printf '    %s%s%s Compilando %s (%s); pode levar alguns minutos...\n' "$CIANO" "$I_INFO" "$RESET" "$SLUG" "$amb"
@@ -1377,7 +1413,7 @@ if [ "$DEPLOY" = 1 ]; then
     if [ "$seguir" = 1 ] && tem_sistema_atual; then
       printf '    %s%s%s Imagens prontas. O sistema atual sai do ar até o deploy terminar (cerca de 1 minuto):\n' "$CIANO" "$I_INFO" "$RESET"
       if ! parar_sistema_atual; then
-        aviso "Portas 80/3001 ainda ocupadas: deploy não executado"
+        aviso "Porta(s) $PORTAS_TXT ainda ocupada(s): deploy não executado"
         religar_sistema_atual
         seguir=0
       fi
@@ -1385,7 +1421,7 @@ if [ "$DEPLOY" = 1 ]; then
 
     # 3. Deploy, homologação primeiro; se falhar, o sistema anterior é religado
     if [ "$seguir" = 1 ]; then
-      for amb in "$HML_NOME" "$PROD_NOME"; do
+      for amb in "${ORDEM_DEPLOY[@]}"; do
         for spec in "${REPOS[@]}"; do
           ler_repo "$spec"
           if sg docker -c "cd '$RAIZ/$amb' && bash deploy.sh '$amb'" </dev/null; then
@@ -1423,7 +1459,7 @@ fi
 etapa "Resumo"
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
-  printf '    %s%s%s %s %s%s %s%s\n' "$AZUL" "$I_LOGO" "$RESET" "$SLUG" "$FRACO" "$I_SETA" "$RAIZ/{$PROD_NOME,$HML_NOME}" "$RESET"
+  printf '    %s%s%s %s %s%s %s%s\n' "$AZUL" "$I_LOGO" "$RESET" "$SLUG" "$FRACO" "$I_SETA" "$(if [ "$SEM_HML" = 1 ]; then echo "$RAIZ/$PROD_NOME (só produção)"; else echo "$RAIZ/{$PROD_NOME,$HML_NOME}"; fi)" "$RESET"
 done
 if [ "${#PENDENCIAS[@]}" -eq 0 ]; then
   ok "Nenhuma pendência"
