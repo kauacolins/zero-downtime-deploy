@@ -79,6 +79,10 @@ Ele também lê o código do sistema e adapta o que gera:
 | `process.env.X` ausentes do `.env.example` | Acrescenta ao `.env.example`, de onde o `setup-host.sh` cria o `.env` |
 | `package.json` | Monta o job de teste: versão do Node, `npm ci`, `prisma generate`, `tsc` ou `typecheck` e `test` |
 | `next.config` sem `output: "standalone"` (stack Next.js) | Acrescenta; avisa se o código usa Server Actions sem `allowedOrigins` |
+| Pipelines de deploy antigos: workflows do GitHub ou `.gitlab-ci.yml` com PM2, `ssh`/`scp`/`rsync`, `git pull`, `npm run build` ou `prisma migrate` | Desativa (vão para `.bak`, que o CI não lê), para cada push não fazer dois deploys; no modo interativo vêm marcados, sem perguntas é `--replace-ci`. `ecosystem.config.*`, `deploy.json`, `Procfile` e `.gitlab/ci/` entram no relatório como obsoletos |
+| Páginas e layouts de servidor que consultam o banco sem `dynamic`, `revalidate` nem APIs dinâmicas (stack Next.js) | Oferece `export const dynamic = "force-dynamic"`: o `next build` pré-renderiza essas páginas, e no build não há banco (`--force-dynamic`) |
+
+No fim, com Docker na máquina, o script pode validar a imagem com `docker build` (`--check-build`; no modo interativo, ele pergunta). Se o build quebrar ao gerar uma página (`Error occurred prerendering page`), ele acha o arquivo da rota, oferece o `force-dynamic` e compila de novo. O `next build` para na primeira página que falha, então isso pode se repetir algumas vezes. Uma consulta feita num módulo auxiliar só aparece aqui, não na detecção prévia.
 
 Homologação só com IP atende apenas na porta de homologação; o IP na porta 80 é recusado, a menos que `--prod-ip` o mande para a produção. `--upload-limit` ajusta o maior envio aceito pelo Nginx (padrão `25m`) e, no GitLab, `--runner-tag` define a tag do runner da VM (padrão: o nome do sistema).
 

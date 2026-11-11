@@ -38,7 +38,12 @@ Opções:
   --ci github|gitlab          padrão: github
   --stack NOME                copia também os arquivos de examples/NOME (ex.: nextjs-prisma):
                               Dockerfile, .dockerignore, migração, rota de saúde, .env.example
-  --replace-ci                move um CI antigo (não gerado por este projeto) para .bak
+  --replace-ci                desativa os pipelines de deploy antigos (PM2, ssh, git pull...):
+                              vão para .bak, que o CI não lê
+  --force-dynamic             stack Next.js: acrescenta export const dynamic = "force-dynamic"
+                              às páginas que consultam o banco e seriam pré-renderizadas no build
+  --check-build               no fim, valida com docker build (precisa de Docker); no modo
+                              interativo, pergunta. --no-check-build não pergunta
   --volume PASTA              pasta onde a aplicação grava arquivos (ex.: public/uploads), montada
                               fora do contêiner para não se perder no deploy; repita para várias.
                               Sem --volume, o script procura no código (padrão: uploads)
@@ -78,7 +83,7 @@ AJUDA
 SISTEMA="" DOMINIO_PROD="" DOMINIO_HML="" PORTA_APP="" HEALTH="" PORTA_HML=""
 PROD_NOME="" PROD_BRANCH="" HML_NOME="" HML_BRANCH="" CI="" STACK="" STACK_DEFINIDA=0 DESTINO=""
 SEM_HML=0 SEM_HML_DEF=0
-INTERATIVO=auto SUBSTITUIR_CI=0
+INTERATIVO=auto SUBSTITUIR_CI=0 FORCE_DYNAMIC=0 CHECK_BUILD=""
 VOLUMES=() VOLUMES_DEF=0 COPIAR=() COPIAR_DEF=0 LIMITE_UPLOAD="" IP_PROD="" TAG_RUNNER=""
 
 while [ $# -gt 0 ]; do
@@ -97,6 +102,9 @@ while [ $# -gt 0 ]; do
     --ci) CI="$2"; shift 2 ;;
     --stack) STACK="$2"; STACK_DEFINIDA=1; shift 2 ;;
     --replace-ci|--substituir-ci) SUBSTITUIR_CI=1; shift ;;
+    --force-dynamic) FORCE_DYNAMIC=1; shift ;;
+    --check-build) CHECK_BUILD=1; shift ;;
+    --no-check-build) CHECK_BUILD=0; shift ;;
     --volume) VOLUMES+=("$2"); VOLUMES_DEF=1; shift 2 ;;
     --no-volume|--sem-volume) VOLUMES=(); VOLUMES_DEF=1; shift ;;
     --copy|--copiar) COPIAR+=("$2"); COPIAR_DEF=1; shift 2 ;;
@@ -385,6 +393,136 @@ todas_marcadas() {
   for v in "$@"; do OPCOES+=("$v|$v"); MARCADOS+="${MARCADOS:+ }$i"; i=$((i + 1)); done
 }
 
+# ---------------------------------------------------------------------------
+# Pipeline de deploy antigo (ex.: git pull + pm2 restart por ssh)
+
+# Por que um arquivo de CI parece deploy antigo: os motivos, separados por vírgula (vazio: não parece)
+motivos_deploy() {
+  local m=()
+  grep -qiE '\bpm2\b' "$1" && m+=("pm2")
+  grep -qiE '\b(ssh|scp|rsync)\b|appleboy/' "$1" && m+=("ssh")
+  grep -qiE 'git pull' "$1" && m+=("git pull")
+  grep -qiE '(npm|yarn|pnpm) (run )?build|next build' "$1" && m+=("build")
+  grep -qiE 'prisma migrate' "$1" && m+=("prisma migrate")
+  local IFS=,
+  echo "${m[*]}"
+}
+
+# CIS_ANTIGOS: CI do mesmo provedor que não é deste projeto e faz deploy (ou ocupa o arquivo que
+# vai ser gerado), "arquivo|motivos". OBSOLETOS: o que o deploy novo deixa sem uso.
+detectar_pipeline_antigo() {
+  local f rel motivos
+  CIS_ANTIGOS=() OBSOLETOS=()
+  if [ "$CI" = gitlab ]; then
+    set -- "$DESTINO/.gitlab-ci.yml"
+  else
+    set -- "$DESTINO"/.github/workflows/*.yml "$DESTINO"/.github/workflows/*.yaml
+  fi
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    grep -q zero-downtime-deploy "$f" && continue
+    rel="${f#"$DESTINO"/}"
+    motivos="$(motivos_deploy "$f")"
+    if [ -n "$motivos" ] || [ "$rel" = "$ARQ_CI" ]; then CIS_ANTIGOS+=("$rel|${motivos:-ocupa o arquivo do CI novo}"); fi
+  done
+  for f in ecosystem.config.js ecosystem.config.cjs ecosystem.config.mjs ecosystem.config.json \
+    deploy.json Procfile .gitlab/ci; do
+    [ -e "$DESTINO/$f" ] && OBSOLETOS+=("$f")
+  done
+  # CI do outro provedor com deploy: ninguém mais o roda, mas confunde
+  if [ "$CI" = gitlab ]; then set -- "$DESTINO"/.github/workflows/*.y*ml; else set -- "$DESTINO/.gitlab-ci.yml"; fi
+  for f in "$@"; do
+    [ -f "$f" ] && ! grep -q zero-downtime-deploy "$f" && [ -n "$(motivos_deploy "$f")" ] && OBSOLETOS+=("${f#"$DESTINO"/}")
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Páginas do Next que consultam o banco e seriam pré-renderizadas no build (que não tem banco)
+
+# Pastas app/ do projeto
+pastas_app() { local d; for d in "$DESTINO/src/app" "$DESTINO/app"; do [ -d "$d" ] && echo "$d"; done; return 0; }
+
+# Rota de uma page.tsx (sem grupos "(x)" nem slots "@x"): app/(admin)/painel/page.tsx -> /painel
+rota_da_pagina() {
+  local r="$1"
+  r="${r#"$DESTINO"/src/app}" r="${r#"$DESTINO"/app}"
+  r="$(dirname "$r" | sed -E 's#/\([^/]*\)##g; s#/@[^/]*##g')"
+  [ "$r" = . ] || [ -z "$r" ] && r=/
+  echo "$r"
+}
+
+# Detecção prévia: páginas e layouts de servidor que consultam o banco, sem dynamic/revalidate e sem
+# APIs que já os tornam dinâmicos (cookies, headers, auth, searchParams) nem segmento [param]
+detectar_paginas_com_banco() {
+  local d f
+  while IFS= read -r d; do
+    while IFS= read -r f; do
+      [[ "$f" == *"["* ]] && continue
+      grep -qE "^[[:space:]]*['\"]use client['\"]" "$f" && continue
+      grep -qE 'export const (dynamic|revalidate)|generateStaticParams' "$f" && continue
+      grep -qE '\bprisma\.|\bdb\.[a-zA-Z]+\.(find|count|aggregate|groupBy)|from ['\''"]@/lib/(db|prisma)' "$f" || continue
+      grep -qE '\b(cookies|headers|auth|getServerSession|draftMode|connection|noStore|unstable_noStore)\(|searchParams' "$f" && continue
+      echo "${f#"$DESTINO"/}"
+    done < <(find "$d" -type f \( -name 'page.tsx' -o -name 'page.ts' -o -name 'page.jsx' -o -name 'page.js' \
+      -o -name 'layout.tsx' -o -name 'layout.jsx' \) 2>/dev/null | sort)
+  done < <(pastas_app)
+}
+
+# Acrescenta export const dynamic = "force-dynamic" depois dos imports (mantém o CRLF do arquivo)
+aplicar_force_dynamic() {
+  local arq="$DESTINO/$1" cr="" tmp
+  grep -q 'export const dynamic' "$arq" && return 0
+  if [ -n "$(tr -dc '\r' <"$arq" | head -c1)" ]; then cr=$'\r'; fi
+  tmp="$(mktemp)"
+  CR="$cr" awk '
+    BEGIN { feito = 0; noimport = 0; cr = ENVIRON["CR"] }
+    feito { print; next }
+    noimport { print; if ($0 ~ /from ["\047][^"\047]*["\047];?[ \t\r]*$/) noimport = 0; next }
+    /^import[ \t]/ { print; if ($0 !~ /from ["\047][^"\047]*["\047];?[ \t\r]*$/ && $0 !~ /^import ["\047]/) noimport = 1; next }
+    /^[ \t\r]*$/ || /^[ \t]*\/\// || /^["\047]use / { print; next }
+    { print "// O build não tem acesso ao banco: renderiza a cada pedido, não no build" cr
+      print "export const dynamic = \"force-dynamic\";" cr
+      print cr
+      print; feito = 1 }
+  ' "$arq" >"$tmp" && cat "$tmp" >"$arq"
+  rm -f "$tmp"
+  printf '  %s~%s %s: export const dynamic = "force-dynamic"\n' "$AMARELO" "$RESET" "$1"
+}
+
+# Arquivo de cada rota que falhou na pré-renderização, lida da saída do next build
+paginas_das_rotas() {
+  local rota d f
+  while IFS= read -r rota; do
+    while IFS= read -r d; do
+      while IFS= read -r f; do
+        [ "$(rota_da_pagina "$f")" = "$rota" ] && echo "${f#"$DESTINO"/}"
+      done < <(find "$d" -type f \( -name 'page.tsx' -o -name 'page.ts' -o -name 'page.jsx' -o -name 'page.js' \) 2>/dev/null)
+    done < <(pastas_app)
+  done
+}
+
+# docker build da imagem final, sem publicar nada. Saída em $BUILD_LOG
+validar_build() {
+  local alvo=()
+  BUILD_LOG="$(mktemp)"
+  grep -qiE '^FROM .* AS runner' "$DESTINO/Dockerfile" && alvo=(--target runner)
+  printf '  %s%s Compilando a imagem (docker build); pode levar alguns minutos...%s\n' "$FRACO" "$I_INFO" "$RESET"
+  if docker build "${alvo[@]}" --progress=plain -t "zdd-check-$SISTEMA" "$DESTINO" >"$BUILD_LOG" 2>&1; then
+    docker image rm "zdd-check-$SISTEMA" >/dev/null 2>&1 || true
+    return 0
+  fi
+  return 1
+}
+
+# Rotas que falharam na pré-renderização (Next 13 a 15)
+rotas_com_erro() {
+  { grep -oE 'Error occurred prerendering page "[^"]+"' "$BUILD_LOG" | sed -E 's/.*"([^"]+)"/\1/'
+    grep -oE 'Export encountered an error on [^ ,]+' "$BUILD_LOG" | sed -E 's/.* on //; s#/page:?$##'
+    grep -oE '^[#0-9. ]*/[^ :]*/page: /[^ ]*' "$BUILD_LOG" | sed -E 's/.*: //'
+  } | sed -E 's#/\([^/]*\)##g; s#^$#/#' | sort -u  # sem grupos: /(painel)/usuarios é /usuarios
+}
+
 # Faltou algo obrigatório e há terminal: pergunta em vez de parar
 if [ "$INTERATIVO" = auto ]; then
   if { [ -z "$SISTEMA" ] || [ -z "$DOMINIO_PROD" ] || { [ -z "$DOMINIO_HML" ] && [ "$SEM_HML" = 0 ]; } || [ -z "$DESTINO" ]; } \
@@ -575,16 +713,46 @@ for v in "${COPIAR[@]}"; do
   [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "$v" != *..* ]] || falha "pasta inválida em --copy: $v"
 done
 
-# CI que já existe e não foi gerado por este projeto (ex.: git pull + pm2 restart)
+# Pipelines de deploy antigos (ex.: git pull + pm2 restart): sem desativá-los, cada push faria
+# dois deploys, o antigo e o novo
 if [ "$CI" = gitlab ]; then ARQ_CI=.gitlab-ci.yml; else ARQ_CI=.github/workflows/deploy.yml; fi
-CI_ANTIGO=0 CI_ANTIGO_TESTES=0
-if [ -f "$DESTINO/$ARQ_CI" ] && ! grep -q zero-downtime-deploy "$DESTINO/$ARQ_CI"; then
-  CI_ANTIGO=1
-  if [ "$INTERATIVO" = 1 ] && [ "$SUBSTITUIR_CI" = 0 ]; then
-    escolher acao "$ARQ_CI já existe e não foi gerado pelo zero-downtime-deploy" 1 \
-      "manter|manter (o deploy novo não roda pelo CI até você ajustá-lo)" \
-      "substituir|substituir (o atual fica em $ARQ_CI.bak, que o CI não lê)"
-    [ "$acao" = substituir ] && SUBSTITUIR_CI=1
+detectar_pipeline_antigo
+DESATIVAR=()
+if [ "${#CIS_ANTIGOS[@]}" -gt 0 ]; then
+  if [ "$SUBSTITUIR_CI" = 1 ]; then
+    for e in "${CIS_ANTIGOS[@]}"; do DESATIVAR+=("${e%%|*}"); done
+  elif [ "$INTERATIVO" = 1 ]; then
+    opcoes=() marcados="" i=1
+    for e in "${CIS_ANTIGOS[@]}"; do
+      opcoes+=("${e%%|*}|${e%%|*}  ${FRACO}(${e#*|})$RESET")
+      marcados+="${marcados:+ }$i"
+      i=$((i + 1))
+    done
+    escolher_varios DESATIVAR "Pipelines de deploy antigos (os marcados vão para .bak e deixam de rodar)" "$marcados" "${opcoes[@]}"
+    if [ "${#DESATIVAR[@]}" -eq "${#CIS_ANTIGOS[@]}" ]; then SUBSTITUIR_CI=1; fi
+  fi
+fi
+
+# Páginas que consultam o banco e quebrariam o next build
+FORCE_PAGINAS=() PAGINAS_BANCO=()
+if [[ "$STACK" == nextjs* ]]; then
+  mapfile -t PAGINAS_BANCO < <(detectar_paginas_com_banco)
+  if [ "${#PAGINAS_BANCO[@]}" -gt 0 ]; then
+    if [ "$FORCE_DYNAMIC" = 1 ]; then
+      FORCE_PAGINAS=("${PAGINAS_BANCO[@]}")
+    elif [ "$INTERATIVO" = 1 ]; then
+      todas_marcadas "${PAGINAS_BANCO[@]}"
+      escolher_varios FORCE_PAGINAS "Páginas que consultam o banco e seriam geradas no build, sem banco (marcadas: renderizar a cada pedido)" "$MARCADOS" "${OPCOES[@]}"
+      if [ "${#FORCE_PAGINAS[@]}" -eq "${#PAGINAS_BANCO[@]}" ]; then FORCE_DYNAMIC=1; fi
+    fi
+  fi
+fi
+
+# Validação com docker build no fim
+if [ -z "$CHECK_BUILD" ]; then
+  CHECK_BUILD=0
+  if [ "$INTERATIVO" = 1 ] && command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    if sim_nao "No fim, validar com docker build? (alguns minutos; acha páginas que quebram o build)" s; then CHECK_BUILD=1; fi
   fi
 fi
 
@@ -602,6 +770,8 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "$PROD_NOME" != production ]; then cmd+=" --prod-name $PROD_NOME"; fi
   if [ "$HML_NOME" != developer ] && [ "$SEM_HML" = 0 ]; then cmd+=" --staging-name $HML_NOME"; fi
   if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --replace-ci"; fi
+  if [ "$FORCE_DYNAMIC" = 1 ]; then cmd+=" --force-dynamic"; fi
+  if [ "$CHECK_BUILD" = 1 ]; then cmd+=" --check-build"; fi
   if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --no-volume"; fi
   for v in "${VOLUMES[@]}"; do cmd+=" --volume $v"; done
   for v in "${COPIAR[@]}"; do cmd+=" --copy $v"; done
@@ -619,7 +789,9 @@ if [ "$INTERATIVO" = 1 ]; then
   else
     linha Homologação "$DOMINIO_HML  ${FRACO}porta $PORTA_HML na VM · branch $HML_BRANCH$RESET"
   fi
-  linha CI "$CI$([ "$SUBSTITUIR_CI" = 1 ] && echo "  ${FRACO}(o atual vai para .bak)$RESET")"
+  linha CI "$CI$([ "${#DESATIVAR[@]}" -gt 0 ] && echo "  ${FRACO}(${#DESATIVAR[@]} pipeline(s) antigo(s) vão para .bak)$RESET")"
+  if [ "${#FORCE_PAGINAS[@]}" -gt 0 ]; then linha "Páginas" "${#FORCE_PAGINAS[@]} com force-dynamic"; fi
+  if [ "$CHECK_BUILD" = 1 ]; then linha "Validação" "docker build no fim"; fi
   linha Stack "${STACK:-nenhuma}"
   linha Volumes "${VOLUMES[*]:-nenhum}  ${FRACO}(montados fora do contêiner)$RESET"
   if [ "${#COPIAR[@]}" -gt 0 ]; then linha "Na imagem" "${COPIAR[*]}"; fi
@@ -633,11 +805,12 @@ if [ "$INTERATIVO" = 1 ]; then
   echo
 fi
 
-if [ "$CI_ANTIGO" = 1 ] && [ "$SUBSTITUIR_CI" = 1 ]; then
-  mv "$DESTINO/$ARQ_CI" "$DESTINO/$ARQ_CI.bak"
-  if grep -qiE 'jest|vitest|tsc|npm (run )?test|pytest|mvn|gradle' "$DESTINO/$ARQ_CI.bak"; then CI_ANTIGO_TESTES=1; fi
-  printf '  %s%s%s %s antigo movido para %s.bak\n' "$AMARELO" "$I_MOVIDO" "$RESET" "$ARQ_CI" "$ARQ_CI"
-fi
+CI_ANTIGO_TESTES=0
+for f in "${DESATIVAR[@]}"; do
+  mv "$DESTINO/$f" "$DESTINO/$f.bak"
+  if grep -qiE 'jest|vitest|tsc|npm (run )?test|pytest|mvn|gradle' "$DESTINO/$f.bak"; then CI_ANTIGO_TESTES=1; fi
+  printf '  %s%s%s %s antigo movido para %s.bak (não roda mais)\n' "$AMARELO" "$I_MOVIDO" "$RESET" "$f" "$f"
+done
 
 # Job de teste a partir do package.json: define TESTE_IMAGEM, TESTE_NODE, TESTE_GESTOR e TESTE_CMDS
 montar_testes() {
@@ -899,8 +1072,48 @@ printf '%s%s Código%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
 completar_env_example
 NEXT_STANDALONE=""
 if [[ "$STACK" == nextjs* ]]; then ajustar_next_config; fi
+for f in "${FORCE_PAGINAS[@]}"; do aplicar_force_dynamic "$f"; done
 if [ "$ENV_NOVAS" = 0 ] && [ "$NEXT_STANDALONE" != adicionado ]; then
   printf '  %s%s nada a ajustar%s\n' "$FRACO" "$I_MANTIDO" "$RESET"
+fi
+
+# Validação: o Dockerfile compila? O next build pré-renderiza páginas, e no build não há banco
+BUILD_OK="" BUILD_LOG=""
+if [ "$CHECK_BUILD" = 1 ]; then
+  printf '%s%s Validação%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
+  if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+    printf '  %s%s Docker indisponível nesta máquina: a validação fica para o primeiro deploy%s\n' "$AMARELO" "$I_AVISO" "$RESET"
+  elif [ ! -f "$DESTINO/Dockerfile" ]; then
+    printf '  %s%s Sem Dockerfile: nada a validar%s\n' "$AMARELO" "$I_AVISO" "$RESET"
+  else
+    # O next build para na primeira página que falha: cada volta revela a seguinte
+    tentativas=5
+    while [ "$tentativas" -gt 0 ]; do
+      tentativas=$((tentativas - 1))
+      if validar_build; then
+        BUILD_OK=1
+        printf '  %s%s%s A imagem compila\n' "$VERDE" "$I_OK" "$RESET"
+        break
+      fi
+      BUILD_OK=0
+      mapfile -t rotas < <(rotas_com_erro)
+      mapfile -t paginas < <(printf '%s\n' "${rotas[@]}" | grep -v '^$' | paginas_das_rotas | sort -u)
+      if [ "${#paginas[@]}" -eq 0 ] || [ "$tentativas" -eq 0 ]; then
+        printf '  %s%s A imagem não compila. Últimas linhas (log completo em %s):%s\n' "$VERMELHO" "$I_ERRO" "$BUILD_LOG" "$RESET"
+        tail -20 "$BUILD_LOG" | sed 's/^/      /'
+        break
+      fi
+      printf '  %s%s O build quebrou ao gerar %s (sem banco no build)%s\n' "$AMARELO" "$I_AVISO" "${rotas[*]}" "$RESET"
+      aplicar=0
+      if [ "$FORCE_DYNAMIC" = 1 ]; then
+        aplicar=1
+      elif [ "$INTERATIVO" = 1 ] && sim_nao "Acrescentar force-dynamic em ${paginas[*]} e compilar de novo?" s; then
+        aplicar=1
+      fi
+      [ "$aplicar" = 1 ] || break
+      for f in "${paginas[@]}"; do aplicar_force_dynamic "$f"; FORCE_PAGINAS+=("$f"); done
+    done
+  fi
 fi
 
 # Marcador esquecido em algum modelo
@@ -956,13 +1169,35 @@ if [ "${#TESTE_CMDS[@]}" -gt 0 ]; then
 else
   item 'os testes no job "test" do CI'
 fi
-if [ "$CI_ANTIGO" = 1 ] && [ "$SUBSTITUIR_CI" = 1 ]; then
+if [ "${#DESATIVAR[@]}" -gt 0 ]; then
   if [ "$CI_ANTIGO_TESTES" = 1 ]; then
-    item "o CI antigo rodava testes: confira se o job test novo cobre o mesmo, depois apague $ARQ_CI.bak"
+    item "o pipeline antigo rodava testes: confira se o job test novo cobre o mesmo, depois apague os .bak"
   else
-    item "apagar $ARQ_CI.bak depois de conferir"
+    item "apagar os .bak dos pipelines antigos depois de conferir: $(printf '%s.bak ' "${DESATIVAR[@]}")"
   fi
-  if [ -d "$DESTINO/.gitlab/ci" ]; then item "apagar .gitlab/ci/, se só o CI antigo a usava"; fi
+fi
+for e in "${CIS_ANTIGOS[@]}"; do
+  f="${e%%|*}"
+  printf '%s\n' "${DESATIVAR[@]}" | grep -qxF "$f" && continue
+  if [ "$f" = "$ARQ_CI" ]; then
+    item "$f é o pipeline antigo (${e#*|}) e o CI novo não foi gerado no lugar dele: rode de novo com --replace-ci"
+  else
+    item "$f continua ativo e faz deploy antigo (${e#*|}): cada push faria dois deploys. Desative-o (--replace-ci)"
+  fi
+done
+if [ "${#OBSOLETOS[@]}" -gt 0 ]; then
+  item "obsoletos com o deploy novo, apague depois da troca na VM: ${OBSOLETOS[*]}"
+fi
+if [[ "$STACK" == nextjs* ]]; then
+  for f in "${PAGINAS_BANCO[@]}"; do
+    printf '%s\n' "${FORCE_PAGINAS[@]}" | grep -qxF "$f" && continue
+    item "$f consulta o banco e seria gerada no build (sem banco): use export const dynamic = \"force-dynamic\" (--force-dynamic)"
+  done
+fi
+if [ "$BUILD_OK" = 0 ]; then
+  item "a imagem não compila: corrija e valide com docker build (log em $BUILD_LOG)"
+elif [ "$CHECK_BUILD" != 1 ] && [ -f "$DESTINO/Dockerfile" ]; then
+  item "validar a imagem antes do push: docker build $( grep -qiE '^FROM .* AS runner' "$DESTINO/Dockerfile" && echo '--target runner ')."
 fi
 if [ "$CI" = gitlab ]; then
   item "o runner da VM precisa da tag $TAG_RUNNER (ou troque tags: no .gitlab-ci.yml)"
