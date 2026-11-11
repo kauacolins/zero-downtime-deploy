@@ -363,6 +363,39 @@ escolher_branch() {
   printf -v "$__destino" '%s' "$escolha"
 }
 
+# Runners do GitHub Actions na VM inteira, de qualquer usuário e pasta: os serviços actions.runner.*
+# e as pastas com .runner. Um por linha: "pasta|repositório|nome|dono|serviço ativo (1/0)"
+listar_runners_vm() {
+  local d url nome dono ativo svc
+  {
+    for svc in $(systemctl list-unit-files --type=service --no-legend 'actions.runner.*' 2>/dev/null | awk '{print $1}'); do
+      systemctl show -p ExecStart --value "$svc" 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2 | xargs -r dirname
+    done
+    sudo find /home /root /opt -maxdepth 3 -name .runner -type f 2>/dev/null | xargs -r -n1 dirname
+  } | sort -u | while IFS= read -r d; do
+    sudo test -f "$d/.runner" || continue
+    url="$(sudo cat "$d/.runner" | tr -d '\r\000\357\273\277' | grep -oE '"gitHubUrl": *"[^"]+"' | cut -d'"' -f4)"
+    nome="$(sudo cat "$d/.runner" | tr -d '\r\000\357\273\277' | grep -oE '"agentName": *"[^"]+"' | cut -d'"' -f4)"
+    dono="$(stat -c %U "$d" 2>/dev/null || echo ?)"
+    ativo=0
+    svc="$(sudo cat "$d/.service" 2>/dev/null || true)"
+    if [ -n "$svc" ] && systemctl is-active --quiet "$svc" 2>/dev/null; then ativo=1; fi
+    echo "$d|$url|$nome|$dono|$ativo"
+  done
+  return 0
+}
+
+# Remove um runner: para e desinstala o serviço e tira o registro do GitHub (precisa do GH_TOKEN)
+remover_runner() {
+  local d="$1" dono="$2" token
+  token="$(gh_api POST "repos/$SLUG/actions/runners/remove-token" 2>/dev/null | grep -oE '"token": *"[^"]+"' | cut -d'"' -f4 || true)"
+  sudo bash -c "cd '$d' && ./svc.sh stop; ./svc.sh uninstall" >/dev/null 2>&1 || true
+  if [ -n "$token" ] && sudo -u "$dono" bash -c "cd '$d' && ./config.sh remove --token '$token'" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 # Chamada à API do GitHub com o GH_TOKEN
 gh_api() {
   curl -fsS -X "$1" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
@@ -1112,6 +1145,14 @@ for spec in "${REPOS[@]}"; do
       [ -f "$dest/.gitlab-ci.yml" ] || faltam+=(".gitlab-ci.yml")
     else
       grep -qslE 'self-hosted' "$dest"/.github/workflows/*.y*ml || faltam+=("workflow com runs-on: self-hosted")
+      # Dois workflows de deploy ativos: cada push faria dois deploys (ex.: o antigo, com PM2)
+      for wf in "$dest"/.github/workflows/*.y*ml; do
+        [ -f "$wf" ] || continue
+        grep -q zero-downtime-deploy "$wf" && continue
+        if grep -qiE 'self-hosted|\bpm2\b|appleboy/ssh|git pull' "$wf"; then
+          aviso "$SLUG ($amb): ${wf#"$dest"/} faz deploy além do workflow novo: cada push faria dois deploys. Desative-o no repositório (scaffold.sh --replace-ci)"
+        fi
+      done
     fi
     if [ "$SEM_HML" = 0 ] && [ -f "$dest/nginx/default.conf" ] && ! grep -q '_hml_blue_app' "$dest/nginx/default.conf"; then
       aviso "$SLUG ($amb): o repositório foi gerado sem homologação (scaffold.sh --no-staging): rode este script com --no-staging"
@@ -1184,21 +1225,29 @@ for spec in "${REPOS[@]}"; do
 
     # Valores do .env da instalação atual, só onde o novo ainda está como no exemplo (ou sem a
     # chave): o que já foi preenchido não é trocado. Na homologação, sem banco nem URLs.
+    # DA_ORIGEM: chaves com o valor da instalação atual. Contam como preenchidas mesmo se o
+    # .env.example tiver o mesmo valor (exemplo com valores reais): não são perguntadas de novo
+    # nem trocadas por um segredo gerado.
+    DA_ORIGEM=" "
     if [ -n "$origem" ] && sudo test -f "$origem/.env"; then
       trazidas=0
       while IFS= read -r linha; do
         chave="${linha%%=*}" valor="${linha#*=}"
         if [ "$amb" = "$HML_NOME" ] && [[ "$chave" =~ $CHAVES_SO_PRODUCAO ]]; then continue; fi
+        # Homologação com segredos próprios: com os de produção, um token dela valeria em produção
+        if [ "$amb" = "$HML_NOME" ] && [[ " $SEGREDOS " == *" $chave "* ]]; then continue; fi
+        if [[ "$chave" =~ $CHAVES_DE_BANCO ]]; then
+          valor="$(sed -E 's#(@|//)(localhost|127\.0\.0\.1)([:/]|$)#\1host.docker.internal\3#g' <<<"$valor")"
+        fi
         if grep -qE "^$chave=" "$env"; then
           atual="$(get_env "$env" "$chave")"
+          if [ "$atual" = "$valor" ]; then DA_ORIGEM+="$chave "; continue; fi
           modelo=""
           if [ -n "$exemplo" ]; then modelo="$(get_env "$exemplo" "$chave")"; fi
           [ "$atual" = "$modelo" ] || continue
         fi
-        if [[ "$chave" =~ $CHAVES_DE_BANCO ]]; then
-          valor="$(sed -E 's#(@|//)(localhost|127\.0\.0\.1)([:/]|$)#\1host.docker.internal\3#g' <<<"$valor")"
-        fi
         set_env "$env" "$chave" "$valor"
+        DA_ORIGEM+="$chave "
         trazidas=$((trazidas + 1))
       done < <(sudo cat "$origem/.env" | tr -d '\r' | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true)
       if [ "$trazidas" -gt 0 ]; then ok "$amb: $trazidas valor(es) trazido(s) de $origem/.env"; fi
@@ -1235,6 +1284,8 @@ for spec in "${REPOS[@]}"; do
 
     # Segredos próprios de cada ambiente; os já definidos não mudam (mudar derruba sessões)
     for chave in $SEGREDOS; do
+      # O da instalação atual fica: trocar derrubaria as sessões abertas
+      [[ "$DA_ORIGEM" == *" $chave "* ]] && continue
       atual="$(get_env "$env" "$chave")"
       if [ -z "$atual" ] || { [ -n "$exemplo" ] && [ "$atual" = "$(get_env "$exemplo" "$chave")" ]; }; then
         set_env "$env" "$chave" "$(openssl rand -hex 32)"
@@ -1271,6 +1322,7 @@ for spec in "${REPOS[@]}"; do
       iguais=()
       while IFS= read -r linha; do
         chave="${linha%%=*}" valor="${linha#*=}"
+        [[ "$DA_ORIGEM" == *" $chave "* ]] && continue
         [ -n "$valor" ] && [ "$(get_env "$env" "$chave")" = "$valor" ] && iguais+=("$chave")
       done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$exemplo")
 
@@ -1443,10 +1495,49 @@ else
 etapa "Runners do GitHub Actions"
 for spec in "${REPOS[@]}"; do
   ler_repo "$spec"
-  # Um runner atende um repositório; reaproveita o que já existir para ele
-  existente="$(grep -lsE "\"gitHubUrl\": *\"https://github.com/$SLUG\"" "$HOME"/actions-runner*/.runner | head -1 || true)"
-  if [ -n "$existente" ]; then
-    ok "$SLUG: runner já instalado em $(dirname "$existente")"
+  # Runners deste repositório já instalados na VM (em qualquer pasta e de qualquer usuário; o
+  # endereço não diferencia maiúsculas: SEMIT-SUAS/EGGEM e semit-suas/eggem são o mesmo)
+  slug_min="$(tr '[:upper:]' '[:lower:]' <<<"$SLUG")"
+  mapfile -t deste < <(listar_runners_vm | awk -F'|' -v s="$slug_min" 'tolower($2) ~ ("github.com/" s "/?$")')
+  if [ "${#deste[@]}" -gt 0 ]; then
+    # Fica o primeiro ativo (ou o primeiro); os outros são duplicados
+    manter="$(printf '%s\n' "${deste[@]}" | awk -F'|' '$5 == 1' | head -1)"
+    [ -n "$manter" ] || manter="${deste[0]}"
+    IFS='|' read -r rdir _ rnome rdono rativo <<<"$manter"
+    ok "$SLUG: runner já instalado, reaproveitado: $rnome em $rdir$([ "$rativo" = 1 ] || echo " (serviço parado)")"
+    # A label do sistema, que o workflow pede (runs-on: [self-hosted, <sistema>])
+    if [ -n "${GH_TOKEN:-}" ]; then
+      rjson="$(gh_api GET "repos/$SLUG/actions/runners?per_page=100" 2>/dev/null || true)"
+      rid="$(tr -d '\n' <<<"$rjson" | grep -oE "\\{\"id\": *[0-9]+, *\"name\": *\"$rnome\"" | grep -oE '[0-9]+' | head -1 || true)"
+      if [ -n "$rid" ]; then
+        if gh_api GET "repos/$SLUG/actions/runners/$rid/labels" 2>/dev/null | grep -qE "\"name\": *\"$SISTEMA\""; then
+          ok "$SLUG: o runner $rnome já tem a label $SISTEMA"
+        elif gh_api POST "repos/$SLUG/actions/runners/$rid/labels" "{\"labels\":[\"$SISTEMA\"]}" >/dev/null 2>&1; then
+          ok "$SLUG: label $SISTEMA acrescentada ao runner $rnome"
+        else
+          aviso "$SLUG: não consegui acrescentar a label $SISTEMA ao runner $rnome: faça em Settings > Actions > Runners"
+        fi
+      fi
+    else
+      nota "$SLUG: confira se o runner $rnome tem a label $SISTEMA (Settings > Actions > Runners); sem ela, o deploy fica na fila"
+    fi
+    # Duplicados: cada job roda num runner só, mas dois deixam deploys de produção e homologação
+    # compilarem ao mesmo tempo, e um deles pode ser o do deploy antigo
+    for e in "${deste[@]}"; do
+      [ "$e" != "$manter" ] || continue
+      IFS='|' read -r ddir _ dnome ddono _ <<<"$e"
+      echo "    Outro runner do mesmo repositório: $dnome em $ddir (de $ddono)."
+      # Só com terminal e perguntando (o --yes não remove runner)
+      if [ -n "${GH_TOKEN:-}" ] && [ "$SIM" = 0 ] && confirmar "Remover o runner duplicado $dnome? (a pasta $ddir fica)"; then
+        if remover_runner "$ddir" "$ddono"; then
+          ok "$SLUG: runner duplicado $dnome removido (serviço e registro no GitHub)"
+        else
+          aviso "$SLUG: não consegui remover o runner $dnome: em $ddir, rode sudo ./svc.sh uninstall e ./config.sh remove"
+        fi
+      else
+        nota "$SLUG: runner duplicado $dnome em $ddir. Para remover: cd $ddir && sudo ./svc.sh stop && sudo ./svc.sh uninstall && ./config.sh remove --token <token de remoção>"
+      fi
+    done
     continue
   fi
   if [ -z "${GH_TOKEN:-}" ]; then
