@@ -23,13 +23,16 @@ services:
     # Nunca publique portas aqui: só o Nginx expõe portas, senão as duas cores não sobem juntas
     networks: [web]
     healthcheck:
-      # Tenta wget (Alpine), curl e node, para servir a imagens diferentes. Deixe só o que a sua tiver.
+      # Tenta wget (Alpine), curl, node, python3 e php, para servir a imagens diferentes
+      # (python:slim e php não têm wget nem curl). Deixe só o que a sua tiver.
       test:
         - CMD-SHELL
         - >-
           wget -qO- http://127.0.0.1:{{PORTA_APP}}{{HEALTH}} >/dev/null 2>&1
           || curl -fsS http://127.0.0.1:{{PORTA_APP}}{{HEALTH}} >/dev/null 2>&1
-          || node -e "fetch('http://127.0.0.1:{{PORTA_APP}}{{HEALTH}}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+          || node -e "fetch('http://127.0.0.1:{{PORTA_APP}}{{HEALTH}}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" 2>/dev/null
+          || python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:{{PORTA_APP}}{{HEALTH}}', timeout=3)" >/dev/null 2>&1
+          || php -r "exit(@file_get_contents('http://127.0.0.1:{{PORTA_APP}}{{HEALTH}}') === false ? 1 : 0);" 2>/dev/null
       interval: 5s
       timeout: 3s
       retries: 10

@@ -429,6 +429,8 @@ motivos_deploy() {
   echo "${m[*]}"
 }
 
+RE_DEPLOY=',(pm2|ssh|git pull),'
+
 # CIS_ANTIGOS: CI do mesmo provedor que não é deste projeto e faz deploy (ou ocupa o arquivo que
 # vai ser gerado), "arquivo|motivos". OBSOLETOS: o que o deploy novo deixa sem uso.
 detectar_pipeline_antigo() {
@@ -444,7 +446,8 @@ detectar_pipeline_antigo() {
     grep -q zero-downtime-deploy "$f" && continue
     rel="${f#"$DESTINO"/}"
     motivos="$(motivos_deploy "$f")"
-    if [ -n "$motivos" ] || [ "$rel" = "$ARQ_CI" ]; then CIS_ANTIGOS+=("$rel|${motivos:-ocupa o arquivo do CI novo}"); fi
+    # Build ou migração sozinhos são de um CI de testes; deploy é pm2, ssh ou git pull
+    if [[ ",$motivos," =~ $RE_DEPLOY ]] || [ "$rel" = "$ARQ_CI" ]; then CIS_ANTIGOS+=("$rel|${motivos:-ocupa o arquivo do CI novo}"); fi
   done
   for f in ecosystem.config.js ecosystem.config.cjs ecosystem.config.mjs ecosystem.config.json \
     deploy.json Procfile .gitlab/ci; do
@@ -453,7 +456,7 @@ detectar_pipeline_antigo() {
   # CI do outro provedor com deploy: ninguém mais o roda, mas confunde
   if [ "$CI" = gitlab ]; then set -- "$DESTINO"/.github/workflows/*.y*ml; else set -- "$DESTINO/.gitlab-ci.yml"; fi
   for f in "$@"; do
-    [ -f "$f" ] && ! grep -q zero-downtime-deploy "$f" && [ -n "$(motivos_deploy "$f")" ] && OBSOLETOS+=("${f#"$DESTINO"/}")
+    [ -f "$f" ] && ! grep -q zero-downtime-deploy "$f" && [[ ",$(motivos_deploy "$f")," =~ $RE_DEPLOY ]] && OBSOLETOS+=("${f#"$DESTINO"/}")
   done
   return 0
 }
@@ -631,6 +634,16 @@ carregar_stack() {
   STACK_PERGUNTAR_APP="$(valor_conf "$conf" PERGUNTAR_APP)"; STACK_PERGUNTAR_APP="${STACK_PERGUNTAR_APP:-0}"
   STACK_PERGUNTAR_MIGRACAO="$(valor_conf "$conf" PERGUNTAR_MIGRACAO)"; STACK_PERGUNTAR_MIGRACAO="${STACK_PERGUNTAR_MIGRACAO:-0}"
   STACK_HEALTH_PROPRIA="$(valor_conf "$conf" HEALTH_PROPRIA)"; STACK_HEALTH_PROPRIA="${STACK_HEALTH_PROPRIA:-0}"
+  # Dockerfile próprio: a porta vem dele (EXPOSE, ou --port / 0.0.0.0:PORTA no CMD)
+  if [ "$STACK_PERGUNTAR_APP" = 1 ] && [ -f "$DESTINO/Dockerfile" ]; then
+    local p
+    p="$(grep -m1 -iE '^[[:space:]]*EXPOSE[[:space:]]+[0-9]+' "$DESTINO/Dockerfile" | grep -oE '[0-9]+' | head -1 || true)"
+    if [ -z "$p" ]; then
+      p="$(grep -iE '^[[:space:]]*(CMD|ENTRYPOINT)' "$DESTINO/Dockerfile" \
+        | grep -oE '(--port|-p)"?,? *"?[0-9]{2,5}|0\.0\.0\.0:[0-9]{2,5}' | grep -oE '[0-9]{2,5}$' | head -1 || true)"
+    fi
+    if [ -n "$p" ]; then STACK_APP_PORT="$p"; fi
+  fi
 }
 
 # Grava o deploy.conf com as respostas desta execução
@@ -1148,6 +1161,7 @@ completar_env_example() {
 
 # next.config com output: "standalone" (o Dockerfile da stack copia .next/standalone)
 RE_NEXT_CFG='((const|let|var) +(nextConfig|config)([[:space:]]*:[^=]*)?[[:space:]]*=[[:space:]]*|export +default +|module\.exports *= *)\{[[:space:]]*$'
+RE_NEXT_CFG_VAZIO='((const|let|var) +(nextConfig|config)([[:space:]]*:[^=]*)?[[:space:]]*=[[:space:]]*|export +default +|module\.exports *= *)\{ ?\}'
 ajustar_next_config() {
   NEXT_CFG="$(ls "$DESTINO"/next.config.ts "$DESTINO"/next.config.mjs "$DESTINO"/next.config.js \
     "$DESTINO"/next.config.cjs 2>/dev/null | head -1 || true)"
@@ -1155,11 +1169,17 @@ ajustar_next_config() {
   [ -n "$NEXT_CFG" ] || return 0
   if grep -q standalone "$NEXT_CFG"; then
     NEXT_STANDALONE=ok
-  elif grep -qE "$RE_NEXT_CFG" "$NEXT_CFG"; then
+  elif grep -qE "$RE_NEXT_CFG|$RE_NEXT_CFG_VAZIO" "$NEXT_CFG"; then
     # Linha a linha, em vez de sed -i: preserva o CRLF, que o sed do Git Bash tira do arquivo todo
     local tmp linha feito=0
     tmp="$(mktemp)"
     while IFS= read -r linha || [ -n "$linha" ]; do
+      # Objeto vazio numa linha só: const nextConfig = {};
+      if [ "$feito" = 0 ] && [[ "$linha" =~ $RE_NEXT_CFG_VAZIO ]]; then
+        linha="${linha/\{\}/\{ output: \"standalone\" \}}"
+        linha="${linha/\{ \}/\{ output: \"standalone\" \}}"
+        feito=1
+      fi
       printf '%s\n' "$linha"
       if [ "$feito" = 0 ] && [[ "$linha" =~ $RE_NEXT_CFG ]]; then
         printf '  output: "standalone",%s\n' "$([[ "$linha" == *$'\r' ]] && printf '\r')"
