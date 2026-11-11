@@ -2,6 +2,7 @@
 
 ## Não publicado
 
+- **Adoção da instalação atual** (`--source`): a produção nasce da pasta antiga na VM (copiada sem `node_modules`, builds e caches), com o código posto na versão da branch. `.env`, credenciais, certificados e uploads fora do git vão junto. Antes, mostra mudanças locais, commits só na VM e o que vai junto; depois, troca `localhost` do banco por `host.docker.internal` e avisa de arquivos que entrariam na imagem.
 - **Monorepo:** aplicações em subpastas (front e API) viram um sistema só, com um serviço por aplicação em cada cor, rotas por caminho no Nginx (`/api` → API, com o prefixo removido por padrão) e um `.env` único. `--app`, `--migrate-app` e `APPS`/`MIGRATE_APP` no `deploy.conf`. O `deploy.sh` espera todas as aplicações saudáveis antes de trocar.
 - **Stacks novas:** `node-prisma`, `python` (`--start-cmd`), `java-maven` e `static`. A detecção aceita alternativas (`requirements.txt:|pyproject.toml:`); sem `--stack`, a stack da raiz é detectada também sem perguntas.
 - **Health check** com `python3` e `php` como alternativas; porta do Dockerfile próprio lida do `EXPOSE` ou do `CMD`.

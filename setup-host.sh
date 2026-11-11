@@ -73,10 +73,12 @@ Opções:
                           repetível; libera o banco para a rede Docker no pg_hba.conf. Os bancos
                           do DATABASE_URL/DIRECT_URL de cada .env já são liberados sem a opção
   --source [DONO/REPO=]PASTA
-                          instalação atual do sistema na VM (ex.: o deploy antigo pelo PM2). A
-                          produção recebe os valores do .env dela e os arquivos enviados pelos
-                          usuários (pastas montadas), sincronizados de novo a cada execução; a
-                          homologação recebe o .env sem banco nem URLs. Sem a opção, o modo
+                          instalação atual do sistema na VM (ex.: o deploy antigo pelo PM2 em
+                          /home/suas/sistema). A produção nasce dela: a pasta é copiada (menos
+                          node_modules, builds e caches) e o código vai para a versão da branch;
+                          .env, credenciais, uploads e o resto que está fora do git vão junto. Os
+                          uploads são sincronizados de novo a cada execução. A homologação vem de
+                          um clone limpo e recebe o .env sem banco nem URLs. Sem a opção, o modo
                           interativo procura e pergunta
   --gitlab HOST           repositórios no GitLab (gitlab.com ou um servidor próprio). A deploy
                           key e o runner ficam manuais: o script mostra o passo a passo
@@ -604,6 +606,82 @@ achar_instalacoes() {
       done || true
 }
 
+# Adoção da instalação atual: a pasta de produção nasce dela, em vez de um clone
+# O que se regenera no build ou na execução fica para trás
+EXCLUIR_ADOCAO=(node_modules .next .nuxt .svelte-kit dist build out .turbo .cache .parcel-cache coverage logs tmp
+  .venv venv __pycache__ .pytest_cache target .gradle)
+RE_EXCLUIR_ADOCAO="(^|/)($(IFS='|'; echo "${EXCLUIR_ADOCAO[*]}" | sed 's/\./\\./g'))(/|$)"
+
+git_em() { local d="$1"; shift; sudo git -c safe.directory='*' -C "$d" "$@"; }
+
+# adotar_instalacao ORIGEM DESTINO BRANCH URL: copia a instalação (menos o que se regenera) e põe o
+# código na versão da branch, como o CI faz a cada deploy (fetch e reset --hard). O reset não apaga
+# o que está fora do git: .env, credenciais e uploads ficam, também nos próximos deploys.
+adotar_instalacao() {
+  local origem="$1" dest="$2" branch="$3" url="$4" mudados locais extras n e excl=() chave valor imagem
+  [ -d "$origem/.git" ] || { nota "$origem não é um repositório git: produção clonada, sem adotar"; return 1; }
+  mudados="$(git_em "$origem" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  locais="$(git_em "$origem" log --oneline "origin/$branch..HEAD" 2>/dev/null || true)"
+  extras="$( { git_em "$origem" ls-files --others --exclude-standard
+               git_em "$origem" ls-files --others --ignored --exclude-standard; } 2>/dev/null \
+             | grep -vE "$RE_EXCLUIR_ADOCAO" | sort -u || true)"
+  n="$(grep -c . <<<"$extras" || true)"
+  printf '    Instalação atual %s (branch %s)\n' "$origem" "$(git_em "$origem" branch --show-current 2>/dev/null || echo '?')"
+  if [ -n "$mudados" ]; then
+    echo "    Arquivos versionados com mudança só na VM (o reset desfaz; guarde antes se precisar):"
+    head -15 <<<"$mudados" | sed 's/^/      /'
+  fi
+  if [ -n "$locais" ]; then
+    echo "    Commits só na VM, fora de origin/$branch (o código fica sem eles):"
+    head -10 <<<"$locais" | sed 's/^/      /'
+  fi
+  if [ "$n" -gt 0 ]; then
+    echo "    Fora do git, vão junto ($n):"
+    head -20 <<<"$extras" | sed 's/^/      /'
+    [ "$n" -le 20 ] || echo "      ... e mais $((n - 20))"
+  fi
+  if [ "$INTERATIVO" = 1 ] && ! confirmar "Adotar $origem como $dest? (código na branch $branch; o que está fora do git vai junto)"; then
+    nota "Produção de $SLUG clonada, sem adotar $origem"
+    return 1
+  fi
+
+  mkdir -p "$dest"
+  for e in "${EXCLUIR_ADOCAO[@]}"; do excl+=(--exclude="$e"); done
+  # sudo para ler: a instalação pode ser de outro usuário; a cópia fica com o usuário do deploy
+  if ! sudo tar -C "$origem" "${excl[@]}" -cf - . | tar -C "$dest" -xf - 2>/dev/null; then
+    rm -rf "$dest"
+    aviso "Falha ao copiar $origem para $dest"
+    return 1
+  fi
+  git -C "$dest" remote set-url origin "$url"
+  if ! GIT_SSH_COMMAND="ssh -o BatchMode=yes" git -C "$dest" fetch -q origin "+refs/heads/$branch:refs/remotes/origin/$branch" \
+    || ! git -C "$dest" checkout -q -f -B "$branch" "origin/$branch" \
+    || ! git -C "$dest" reset -q --hard "origin/$branch"; then
+    rm -rf "$dest"
+    aviso "Falha ao pôr $dest na branch $branch (acesso ao repositório?): nada foi adotado"
+    return 1
+  fi
+  ok "$dest adotado de $origem: código da branch $branch, $n arquivo(s) fora do git junto"
+
+  # No contêiner, localhost é o próprio contêiner: o banco da máquina é host.docker.internal
+  if [ -f "$dest/.env" ]; then
+    while IFS= read -r chave; do
+      valor="$(get_env "$dest/.env" "$chave")"
+      if [[ "$valor" =~ (@|//)(localhost|127\.0\.0\.1)([:/]|$) ]]; then
+        set_env "$dest/.env" "$chave" "$(sed -E 's#(@|//)(localhost|127\.0\.0\.1)([:/]|$)#\1host.docker.internal\3#g' <<<"$valor")"
+        ok "$dest/.env: $chave com localhost trocado por host.docker.internal"
+      fi
+    done < <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$dest/.env" | tr -d = | grep -E "$CHAVES_DE_BANCO" || true)
+  fi
+
+  # Fora do git e fora de .env e uploads: entram na imagem no build, a menos que o .dockerignore os tire
+  imagem="$(grep -vE '(^|/)\.env|(^|/)(uploads|storage)/' <<<"$extras" | grep . | head -8 | tr '\n' ' ' || true)"
+  if [ -n "$imagem" ]; then
+    nota "$SLUG: arquivos fora do git que entram na imagem no build (se forem credenciais, monte-os como volume ou passe por variável): $imagem"
+  fi
+  return 0
+}
+
 # Pasta da instalação atual escolhida para DONO/REPO (vazio: nenhuma)
 origem_de() {
   local o
@@ -814,7 +892,7 @@ if [ "$INTERATIVO" = 1 ]; then
         opcoes+=("$d|$d ($info)")
       done
       opcoes+=("|não aproveitar")
-      escolher origem "Instalação atual de $slug encontrada. Aproveitar o .env e os arquivos enviados pelos usuários dela? (o código vem do clone)" 1 "${opcoes[@]}"
+      escolher origem "Instalação atual de $slug encontrada. A produção nasce dela? (código na versão da branch; .env, credenciais e arquivos fora do git vão junto)" 1 "${opcoes[@]}"
       if [ -n "$origem" ]; then ORIGENS+=("$slug=$origem"); fi
     done
   fi
@@ -996,6 +1074,9 @@ if [ "$CLONAR" = 1 ]; then
         ok "$dest já clonado ($(git -C "$dest" branch --show-current))"
       elif ! git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1; then
         aviso "$SLUG não tem a branch $branch: crie-a ou ajuste --prod-branch/--staging-branch ($amb não clonado)"
+      elif [ "$amb" = "$PROD_NOME" ] && [ -n "$(origem_de "$SLUG")" ] \
+        && adotar_instalacao "$(origem_de "$SLUG")" "$dest" "$branch" "$url"; then
+        :
       elif git clone -q -b "$branch" "$url" "$dest"; then
         ok "$dest clonado da branch $branch"
       else

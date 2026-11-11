@@ -161,10 +161,15 @@ Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o re
 
 O script guarda as respostas e onde parou em `~/.local/state/zero-downtime-deploy/`, sem o `GH_TOKEN` e sem os valores do `.env`. Ao rodar `bash setup-host.sh` de novo, por exemplo depois de cadastrar a deploy key ou preencher o `.env`, ele oferece **continuar**: mostra as pendências da última vez, reaproveita as respostas (só pergunta de novo o `GH_TOKEN` e se faz o deploy) e pula o que já foi feito. Também dá para **começar do zero**.
 
-Se o sistema já roda na VM de outro jeito (por exemplo, o deploy antigo com `git pull` e PM2 em `/home/suas/sistema`), o script acha a pasta pelo remoto do git e pergunta se deve aproveitá-la (`--source PASTA`). O código continua vindo do clone. Da instalação atual vêm só:
+Se o sistema já roda na VM de outro jeito (por exemplo, o deploy antigo com `git pull` e PM2 em `/home/suas/sistema`), o script acha a pasta pelo remoto do git e pergunta se a produção deve nascer dela (`--source PASTA`). Isso cobre o que existe só no servidor e não está no repositório: `.env`, credenciais (`.json` do Firebase ou do Google), certificados, configurações locais e uploads.
 
-- **o `.env`**: os valores de produção, com `localhost` do banco trocado por `host.docker.internal`. Assim o `AUTH_SECRET` é o mesmo e quem está logado continua logado. A homologação recebe os mesmos valores, menos banco e URLs do próprio ambiente.
-- **os arquivos enviados pelos usuários** (as pastas montadas, como `public/uploads`), só para a produção. A cada execução, o script traz o que é novo; rode de novo logo antes da troca para não perder nada. Nada é apagado no destino nem na origem.
+1. **Mostra antes:** os arquivos versionados com mudança só na VM, os commits que só existem nela e a lista do que está fora do git e vai junto. Pede confirmação.
+2. **Copia a pasta** para `/opt/<sistema>/production`, menos o que se regenera (`node_modules`, `.next`, `dist`, `build`, caches e logs).
+3. **Põe o código na versão da branch**, com o mesmo `fetch` e `reset --hard` que o CI faz a cada deploy. O código fica igual ao de um clone novo, e o que está fora do git continua lá, também nos próximos deploys.
+4. **Troca `localhost` por `host.docker.internal`** no endereço do banco do `.env`, porque o banco fica fora do contêiner.
+5. **Avisa dos arquivos fora do git que entrariam na imagem** no build. Credenciais devem ser montadas como volume ou passadas por variável, não ficar na imagem.
+
+A homologação vem de um clone limpo e recebe os valores do `.env` de produção, menos banco e URLs do próprio ambiente, porque copiar a pasta levaria credenciais e uploads de produção para ela. Os arquivos enviados pelos usuários são sincronizados de novo a cada execução: rode o script logo antes da troca para não perder nada. Nada é apagado na instalação antiga.
 
 As cores só aparecem num terminal, e `NO_COLOR=1` as desliga; sem locale UTF-8, os ícones viram caracteres simples.
 
