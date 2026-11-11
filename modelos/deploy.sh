@@ -132,7 +132,12 @@ fi
 if [ "$(docker inspect -f '{{.State.Running}}' nginx 2>/dev/null)" = "true" ]; then
   { docker exec nginx nginx -t && docker exec nginx nginx -s reload; } || abort "Falha ao aplicar a configuração do Nginx"
 else
-  docker compose -f "$NGINX_COMPOSE" up -d || abort "O Nginx não subiu (a porta 80 está livre?)"
+  # Porta 80 com outro processo (o sistema antigo, o Nginx da máquina): o CI não o para, de propósito.
+  # A troca do sistema antigo pelo novo é pelo setup-host.sh, que compila antes, pergunta e sabe voltar.
+  if ss -ltnH '( sport = :80 )' 2>/dev/null | grep -q .; then
+    abort "A porta 80 está ocupada por outro processo (o sistema antigo ou o Nginx da máquina?). O primeiro deploy, com um sistema antigo no ar, é pelo setup-host.sh na VM: rode-o, escolha continuar e fazer o primeiro deploy"
+  fi
+  docker compose -f "$NGINX_COMPOSE" up -d || abort "O Nginx não subiu (veja a mensagem acima)"
 fi
 
 if [ -n "$CURRENT" ]; then
