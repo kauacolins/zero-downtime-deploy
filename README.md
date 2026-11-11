@@ -26,11 +26,11 @@ push na dev  ─► runner na VM ─► /opt/<sistema>/developer  ─► bash de
 
 ### Só produção
 
-Sem ambiente de homologação, use `--sem-homologacao` nos dois scripts (no modo interativo, é a pergunta "Ambientes"). O `scaffold.sh` gera o Nginx só com a produção na porta 80, sem a porta 3001, e o CI publica só pela branch de produção. O `setup-host.sh` clona, configura e publica só a produção, não cria banco de homologação e só olha a porta 80. O resto (blue-green, health check, migração) é igual.
+Sem ambiente de homologação, use `--no-staging` nos dois scripts (no modo interativo, é a pergunta "Ambientes"). O `scaffold.sh` gera o Nginx só com a produção na porta 80, sem a porta 3001, e o CI publica só pela branch de produção. O `setup-host.sh` clona, configura e publica só a produção, não cria banco de homologação e só olha a porta 80. O resto (blue-green, health check, migração) é igual.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh) --sem-homologacao
-bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh) --sem-homologacao
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh) --no-staging
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh) --no-staging
 ```
 
 Se a VM for preparada com homologação para um repositório gerado sem ela, o `setup-host.sh` avisa.
@@ -62,8 +62,8 @@ Ou, com o projeto clonado e as opções na linha de comando:
 
 ```bash
 git clone https://github.com/kauacolins/zero-downtime-deploy.git
-bash zero-downtime-deploy/scaffold.sh --sistema meusistema \
-  --dominio-prod meusistema.saoluis.ma.gov.br --dominio-hml hml-meusistema.saoluis.ma.gov.br \
+bash zero-downtime-deploy/scaffold.sh --system meusistema \
+  --prod-domain meusistema.saoluis.ma.gov.br --staging-domain hml-meusistema.saoluis.ma.gov.br \
   --stack nextjs-prisma  ../meusistema
 ```
 
@@ -73,14 +73,14 @@ Ele também lê o código do sistema e adapta o que gera:
 
 | O que ele procura | O que faz |
 | --- | --- |
-| Pastas onde a aplicação grava (`public/uploads`, `storage`, `uploads`...) | Monta todas fora do contêiner, cria-as antes de subir e as tira do git e da imagem (documentos de usuários não podem ir para a imagem). `--volume` escolhe à mão; `--sem-volume`, nenhuma |
-| Pastas lidas em tempo de execução, como `data/` (stack Next.js) | Copia para a imagem, porque o build standalone não as inclui (`--copiar`) |
+| Pastas onde a aplicação grava (`public/uploads`, `storage`, `uploads`...) | Monta todas fora do contêiner, cria-as antes de subir e as tira do git e da imagem (documentos de usuários não podem ir para a imagem). `--volume` escolhe à mão; `--no-volume`, nenhuma |
+| Pastas lidas em tempo de execução, como `data/` (stack Next.js) | Copia para a imagem, porque o build standalone não as inclui (`--copy`) |
 | `NEXT_PUBLIC_*` no código | Passa como argumento de build, com o valor do `.env` de cada pasta: o Next grava essas variáveis no build |
 | `process.env.X` ausentes do `.env.example` | Acrescenta ao `.env.example`, de onde o `setup-host.sh` cria o `.env` |
 | `package.json` | Monta o job de teste: versão do Node, `npm ci`, `prisma generate`, `tsc` ou `typecheck` e `test` |
 | `next.config` sem `output: "standalone"` (stack Next.js) | Acrescenta; avisa se o código usa Server Actions sem `allowedOrigins` |
 
-Homologação só com IP atende apenas na porta de homologação; o IP na porta 80 é recusado, a menos que `--ip-prod` o mande para a produção. `--limite-upload` ajusta o maior envio aceito pelo Nginx (padrão `25m`) e, no GitLab, `--tag-runner` define a tag do runner da VM (padrão: o nome do sistema).
+Homologação só com IP atende apenas na porta de homologação; o IP na porta 80 é recusado, a menos que `--prod-ip` o mande para a produção. `--upload-limit` ajusta o maior envio aceito pelo Nginx (padrão `25m`) e, no GitLab, `--runner-tag` define a tag do runner da VM (padrão: o nome do sistema).
 
 O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
 
@@ -99,18 +99,18 @@ curl -fsSLO https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/ma
 # Pegue com "gh auth token" na sua máquina e cole aqui (não fica no histórico):
 read -rs GH_TOKEN && export GH_TOKEN
 
-bash setup-host.sh --sistema meusistema --repo SEMIT-SUAS/meusistema \
-  --pg-hml meusistema_hml --pg-acesso meusistema:meusistema \
-  --segredos "AUTH_SECRET" --env NODE_ENV=production \
+bash setup-host.sh --system meusistema --repo SEMIT-SUAS/meusistema \
+  --pg-staging meusistema_hml --pg-access meusistema:meusistema \
+  --secrets "AUTH_SECRET" --env NODE_ENV=production \
   --env-prod NEXTAUTH_URL=https://meusistema.saoluis.ma.gov.br \
-  --env-hml NEXTAUTH_URL=http://<IP da VM>:3001
+  --env-staging NEXTAUTH_URL=http://<IP da VM>:3001
 ```
 
-Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--nao-interativo` as desliga.
+Também dá para rodar só `bash setup-host.sh`, sem opções: ele pergunta o repositório, o nome, o `GH_TOKEN` (sem mostrar), as branches (lidas do GitHub), o banco de homologação e os bancos de produção a liberar (em lista de escolha), os segredos e os valores do `.env` que ainda estão iguais ao exemplo. `-i` força as perguntas mesmo com opções; `--non-interactive` as desliga.
 
 O script guarda as respostas e onde parou em `~/.local/state/zero-downtime-deploy/`, sem o `GH_TOKEN` e sem os valores do `.env`. Ao rodar `bash setup-host.sh` de novo, por exemplo depois de cadastrar a deploy key ou preencher o `.env`, ele oferece **continuar**: mostra as pendências da última vez, reaproveita as respostas (só pergunta de novo o `GH_TOKEN` e se faz o deploy) e pula o que já foi feito. Também dá para **começar do zero**.
 
-Se o sistema já roda na VM de outro jeito (por exemplo, o deploy antigo com `git pull` e PM2 em `/home/suas/sistema`), o script acha a pasta pelo remoto do git e pergunta se deve aproveitá-la (`--origem PASTA`). O código continua vindo do clone. Da instalação atual vêm só:
+Se o sistema já roda na VM de outro jeito (por exemplo, o deploy antigo com `git pull` e PM2 em `/home/suas/sistema`), o script acha a pasta pelo remoto do git e pergunta se deve aproveitá-la (`--source PASTA`). O código continua vindo do clone. Da instalação atual vêm só:
 
 - **o `.env`**: os valores de produção, com `localhost` do banco trocado por `host.docker.internal`. Assim o `AUTH_SECRET` é o mesmo e quem está logado continua logado. A homologação recebe os mesmos valores, menos banco e URLs do próprio ambiente.
 - **os arquivos enviados pelos usuários** (as pastas montadas, como `public/uploads`), só para a produção. A cada execução, o script traz o que é novo; rode de novo logo antes da troca para não perder nada. Nada é apagado no destino nem na origem.
@@ -134,7 +134,7 @@ Cada etapa confere se já está feita antes de agir, então o script pode ser ro
 | Pastas | Cria `/opt/<sistema>` com o usuário do deploy como dono |
 | Repositórios | Gera uma deploy key por repositório, cadastra (GitHub, com token) e clona as branches de produção e de homologação |
 | Arquivos de deploy | Confere se cada repositório tem `deploy.sh`, `Dockerfile`, os composes das cores e o CI |
-| Banco de homologação | Opcional (`--pg-hml`): cria o banco e o usuário, e o endereço entra no `.env` de homologação |
+| Banco de homologação | Opcional (`--pg-staging`): cria o banco e o usuário, e o endereço entra no `.env` de homologação |
 | `.env` | Cria a partir do exemplo, gera segredos próprios de cada ambiente, preenche `NEXTAUTH_URL` e afins com o endereço de cada ambiente (lido do `nginx/default.conf`) e grava os valores passados. URLs de banco são pedidas sem eco na tela |
 | Acesso ao PostgreSQL | Libera no `pg_hba.conf` os bancos do `DATABASE_URL`/`DIRECT_URL` de cada `.env` (os que apontam para `host.docker.internal`), sem perguntar. Avisa de regras `trust` abertas e de banco exposto com o firewall desligado |
 | Runner | GitHub: instala um runner por repositório, como serviço. GitLab: mostra o passo a passo |
@@ -160,26 +160,26 @@ Lista completa em `bash setup-host.sh --help`.
 
 | Opção | Para quê |
 | --- | --- |
-| `--sistema NOME` | Obrigatório. As pastas ficam em `/opt/NOME` |
+| `--system NOME` | Obrigatório. As pastas ficam em `/opt/NOME` |
 | `--repo DONO/REPO[:PASTA[:LABELS]]` | Repetível. Com vários repositórios, cada um fica em `/opt/NOME/PASTA` |
-| `--prod-nome`, `--prod-branch` | Padrão: `production`, `main` |
-| `--hml-nome`, `--hml-branch` | Padrão: `developer`, `dev` |
-| `--segredos "CHAVE ..."` | Chaves do `.env` que recebem um segredo aleatório |
-| `--env`, `--env-prod`, `--env-hml CHAVE=VALOR` | Valores gravados no `.env` dos dois ambientes ou de um só |
-| `--pg-hml NOME` | Cria banco e usuário de homologação no PostgreSQL da máquina |
-| `--pg-acesso BANCO:USUARIO` | Libera um banco para a rede Docker no `pg_hba.conf` |
+| `--prod-name`, `--prod-branch` | Padrão: `production`, `main` |
+| `--staging-name`, `--staging-branch` | Padrão: `developer`, `dev` |
+| `--secrets "CHAVE ..."` | Chaves do `.env` que recebem um segredo aleatório |
+| `--env`, `--env-prod`, `--env-staging CHAVE=VALOR` | Valores gravados no `.env` dos dois ambientes ou de um só |
+| `--pg-staging NOME` | Cria banco e usuário de homologação no PostgreSQL da máquina |
+| `--pg-access BANCO:USUARIO` | Libera um banco para a rede Docker no `pg_hba.conf` |
 | `--gitlab HOST` | Repositórios no GitLab; deploy key e runner ficam manuais |
-| `--sem-clone` | Não clona: para sistemas cujo CI cria as pastas sozinho |
+| `--no-clone` | Não clona: para sistemas cujo CI cria as pastas sozinho |
 | `--deploy` | Faz o primeiro deploy no final |
-| `--sim` | Não pergunta antes de parar PM2 e Nginx. **Evite em VM que já atende algum sistema** |
+| `--yes` | Não pergunta antes de parar PM2 e Nginx. **Evite em VM que já atende algum sistema** |
 
 ```bash
 # Dois repositórios (API e frontend), branch de homologação "homolog"
-bash setup-host.sh --sistema cis --hml-nome homolog --hml-branch homolog \
+bash setup-host.sh --system cis --staging-name homolog --staging-branch homolog \
   --repo SEMIT-SUAS/cis-api:api --repo SEMIT-SUAS/cis-frontend:frontend:front
 
 # GitLab próprio, com subgrupo
-bash setup-host.sh --sistema sisx --gitlab gitlab.saoluis.ma.gov.br --repo semit/sistemas/sisx
+bash setup-host.sh --system sisx --gitlab gitlab.saoluis.ma.gov.br --repo semit/sistemas/sisx
 ```
 
 ### GitHub ou GitLab
@@ -249,7 +249,7 @@ Só existe uma versão anterior disponível: o deploy seguinte compila na cor li
 | Sintoma | O que fazer |
 | --- | --- |
 | "Sem acesso de leitura" ao repositório | Cadastre a deploy key mostrada e rode de novo |
-| "não tem a branch" | Crie a branch ou passe `--prod-branch`/`--hml-branch` |
+| "não tem a branch" | Crie a branch ou passe `--prod-branch`/`--staging-branch` |
 | `docker: permission denied` depois do script | Saia e entre de novo na sessão (grupo `docker`) |
 | "O Nginx não subiu" | `sudo ss -ltnp \| grep -E ':80 \|:3001 '` mostra quem ocupa a porta |
 | "não ficou saudável" no deploy | O log da cor nova aparece logo acima. Confira o `.env`, o acesso ao banco e a rota de saúde |

@@ -18,36 +18,38 @@ uso() {
   cat <<'AJUDA'
 Copia os modelos para a raiz do repositório de um sistema (rode na sua máquina, não na VM).
 
-  bash scaffold.sh --sistema siscon \
-    --dominio-prod siscon.saoluis.ma.gov.br --dominio-hml hml-siscon.saoluis.ma.gov.br \
-    --porta-app 3000 --health /api/health  /caminho/do/repositorio
+  bash scaffold.sh --system siscon \
+    --prod-domain siscon.saoluis.ma.gov.br --staging-domain hml-siscon.saoluis.ma.gov.br \
+    --app-port 3000 --health /api/health  /caminho/do/repositorio
 
 Opções:
-  --sistema NOME              obrigatório; o mesmo usado no setup-host.sh
-  --dominio-prod DOMINIO      obrigatório
-  --dominio-hml DOMINIO       obrigatório, a não ser com --sem-homologacao
-  --sem-homologacao           só produção: sem o ambiente de homologação (nem porta 3001, nem
+  --system NOME               obrigatório; o mesmo usado no setup-host.sh
+  --prod-domain DOMINIO       obrigatório
+  --staging-domain DOMINIO    obrigatório, a não ser com --no-staging
+  --no-staging                só produção: sem o ambiente de homologação (nem porta 3001, nem
                               branch, nem job de deploy dele)
-  --porta-app PORTA           porta da aplicação dentro do contêiner (padrão: 3000)
+  --app-port PORTA            porta da aplicação dentro do contêiner (padrão: 3000)
   --health CAMINHO            rota que responde 200 com a aplicação saudável (padrão: /api/health)
-  --porta-hml PORTA           porta de homologação na VM (padrão: 3001)
-  --prod-nome / --prod-branch padrão: production / main
-  --hml-nome  / --hml-branch  padrão: developer / dev
+  --staging-port PORTA        porta de homologação na VM (padrão: 3001)
+  --prod-name / --prod-branch
+                              padrão: production / main
+  --staging-name / --staging-branch
+                              padrão: developer / dev
   --ci github|gitlab          padrão: github
   --stack NOME                copia também os arquivos de examples/NOME (ex.: nextjs-prisma):
                               Dockerfile, .dockerignore, migração, rota de saúde, .env.example
-  --substituir-ci             move um CI antigo (não gerado por este projeto) para .bak
+  --replace-ci                move um CI antigo (não gerado por este projeto) para .bak
   --volume PASTA              pasta onde a aplicação grava arquivos (ex.: public/uploads), montada
                               fora do contêiner para não se perder no deploy; repita para várias.
                               Sem --volume, o script procura no código (padrão: uploads)
-  --sem-volume                nenhuma pasta montada
-  --copiar PASTA              pasta lida em tempo de execução (ex.: data), copiada para a imagem
+  --no-volume                 nenhuma pasta montada
+  --copy PASTA                pasta lida em tempo de execução (ex.: data), copiada para a imagem
                               (stack Next.js); sem a opção, o script procura no código
-  --limite-upload TAMANHO     maior envio aceito pelo Nginx (padrão: 25m)
-  --ip-prod IP                o IP da VM na porta 80 abre a produção (padrão: acesso por IP recusado)
-  --tag-runner TAG            tag do runner da VM no GitLab (padrão: o nome do sistema)
-  -i, --interativo            pergunta o que faltar, mesmo com as opções obrigatórias informadas
-  --nao-interativo            nunca pergunta: falta de opção obrigatória é erro
+  --upload-limit TAMANHO      maior envio aceito pelo Nginx (padrão: 25m)
+  --prod-ip IP                o IP da VM na porta 80 abre a produção (padrão: acesso por IP recusado)
+  --runner-tag TAG            tag do runner da VM no GitLab (padrão: o nome do sistema)
+  -i, --interactive           pergunta o que faltar, mesmo com as opções obrigatórias informadas
+  --non-interactive           nunca pergunta: falta de opção obrigatória é erro
 
 Modo interativo: sem as opções obrigatórias e num terminal, o script pergunta o que faltar.
 Ele lê o repositório (remoto, branches, package.json, CI existente) para sugerir as respostas,
@@ -81,28 +83,28 @@ VOLUMES=() VOLUMES_DEF=0 COPIAR=() COPIAR_DEF=0 LIMITE_UPLOAD="" IP_PROD="" TAG_
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sistema) SISTEMA="$2"; shift 2 ;;
-    --dominio-prod) DOMINIO_PROD="$2"; shift 2 ;;
-    --dominio-hml) DOMINIO_HML="$2"; shift 2 ;;
-    --porta-app) PORTA_APP="$2"; shift 2 ;;
+    --system|--sistema) SISTEMA="$2"; shift 2 ;;
+    --prod-domain|--dominio-prod) DOMINIO_PROD="$2"; shift 2 ;;
+    --staging-domain|--dominio-hml) DOMINIO_HML="$2"; shift 2 ;;
+    --app-port|--porta-app) PORTA_APP="$2"; shift 2 ;;
     --health) HEALTH="$2"; shift 2 ;;
-    --porta-hml) PORTA_HML="$2"; shift 2 ;;
-    --prod-nome) PROD_NOME="$2"; shift 2 ;;
+    --staging-port|--porta-hml) PORTA_HML="$2"; shift 2 ;;
+    --prod-name|--prod-nome) PROD_NOME="$2"; shift 2 ;;
     --prod-branch) PROD_BRANCH="$2"; shift 2 ;;
-    --hml-nome) HML_NOME="$2"; shift 2 ;;
-    --hml-branch) HML_BRANCH="$2"; shift 2 ;;
-    --sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
+    --staging-name|--hml-nome) HML_NOME="$2"; shift 2 ;;
+    --staging-branch|--hml-branch) HML_BRANCH="$2"; shift 2 ;;
+    --no-staging|--sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
     --ci) CI="$2"; shift 2 ;;
     --stack) STACK="$2"; STACK_DEFINIDA=1; shift 2 ;;
-    --substituir-ci) SUBSTITUIR_CI=1; shift ;;
+    --replace-ci|--substituir-ci) SUBSTITUIR_CI=1; shift ;;
     --volume) VOLUMES+=("$2"); VOLUMES_DEF=1; shift 2 ;;
-    --sem-volume) VOLUMES=(); VOLUMES_DEF=1; shift ;;
-    --copiar) COPIAR+=("$2"); COPIAR_DEF=1; shift 2 ;;
-    --limite-upload) LIMITE_UPLOAD="$2"; shift 2 ;;
-    --ip-prod) IP_PROD="$2"; shift 2 ;;
-    --tag-runner) TAG_RUNNER="$2"; shift 2 ;;
-    -i|--interativo) INTERATIVO=1; shift ;;
-    --nao-interativo) INTERATIVO=0; shift ;;
+    --no-volume|--sem-volume) VOLUMES=(); VOLUMES_DEF=1; shift ;;
+    --copy|--copiar) COPIAR+=("$2"); COPIAR_DEF=1; shift 2 ;;
+    --upload-limit|--limite-upload) LIMITE_UPLOAD="$2"; shift 2 ;;
+    --prod-ip|--ip-prod) IP_PROD="$2"; shift 2 ;;
+    --runner-tag|--tag-runner) TAG_RUNNER="$2"; shift 2 ;;
+    -i|--interactive|--interativo) INTERATIVO=1; shift ;;
+    --non-interactive|--nao-interativo) INTERATIVO=0; shift ;;
     -h|--help) uso ;;
     --versao|--version) echo "scaffold.sh $VERSAO"; exit 0 ;;
     -*) echo "Opção desconhecida: $1" >&2; uso 1 ;;
@@ -546,7 +548,7 @@ PROD_NOME="${PROD_NOME:-production}" PROD_BRANCH="${PROD_BRANCH:-main}"
 HML_NOME="${HML_NOME:-developer}" HML_BRANCH="${HML_BRANCH:-dev}" CI="${CI:-github}"
 
 [ -n "$SISTEMA" ] && [ -n "$DOMINIO_PROD" ] && { [ -n "$DOMINIO_HML" ] || [ "$SEM_HML" = 1 ]; } && [ -n "$DESTINO" ] || uso 1
-[[ "$SISTEMA" =~ ^[a-z0-9_]+$ ]] || { echo "--sistema aceita só minúsculas, números e _ (vira nome de contêiner)" >&2; exit 1; }
+[[ "$SISTEMA" =~ ^[a-z0-9_]+$ ]] || { echo "--system aceita só minúsculas, números e _ (vira nome de contêiner)" >&2; exit 1; }
 [[ "$CI" =~ ^(github|gitlab)$ ]] || { echo "--ci aceita github ou gitlab" >&2; exit 1; }
 [ -d "$DESTINO" ] || { echo "Pasta não encontrada: $DESTINO" >&2; exit 1; }
 [ -d "$AQUI/modelos" ] || { echo "Pasta modelos/ não encontrada ao lado do script" >&2; exit 1; }
@@ -555,9 +557,9 @@ if [ -n "$STACK" ] && [ ! -d "$AQUI/examples/$STACK" ]; then
   exit 1
 fi
 LIMITE_UPLOAD="${LIMITE_UPLOAD:-25m}" TAG_RUNNER="${TAG_RUNNER:-$SISTEMA}"
-[[ "$LIMITE_UPLOAD" =~ ^[0-9]+[kKmMgG]?$ ]] || falha "--limite-upload aceita um tamanho como 12m"
-[ -z "$IP_PROD" ] || [[ "$IP_PROD" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || falha "--ip-prod aceita um IPv4"
-[[ "$TAG_RUNNER" =~ ^[A-Za-z0-9_.-]+$ ]] || falha "--tag-runner aceita letras, números, _, . e -"
+[[ "$LIMITE_UPLOAD" =~ ^[0-9]+[kKmMgG]?$ ]] || falha "--upload-limit aceita um tamanho como 12m"
+[ -z "$IP_PROD" ] || [[ "$IP_PROD" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || falha "--prod-ip aceita um IPv4"
+[[ "$TAG_RUNNER" =~ ^[A-Za-z0-9_.-]+$ ]] || falha "--runner-tag aceita letras, números, _, . e -"
 
 [ -n "$FONTES" ] || analisar_repositorio
 if [ "$VOLUMES_DEF" = 0 ]; then
@@ -570,7 +572,7 @@ for i in "${!VOLUMES[@]}"; do
 done
 if [[ "$STACK" == nextjs* ]] && [ "$COPIAR_DEF" = 0 ]; then mapfile -t COPIAR < <(detectar_copiar); fi
 for v in "${COPIAR[@]}"; do
-  [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "$v" != *..* ]] || falha "pasta inválida em --copiar: $v"
+  [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "$v" != *..* ]] || falha "pasta inválida em --copy: $v"
 done
 
 # CI que já existe e não foi gerado por este projeto (ex.: git pull + pm2 restart)
@@ -587,25 +589,25 @@ if [ -f "$DESTINO/$ARQ_CI" ] && ! grep -q zero-downtime-deploy "$DESTINO/$ARQ_CI
 fi
 
 if [ "$INTERATIVO" = 1 ]; then
-  cmd="$CHAMADA --sistema $SISTEMA --dominio-prod $DOMINIO_PROD"
+  cmd="$CHAMADA --system $SISTEMA --prod-domain $DOMINIO_PROD"
   if [ "$SEM_HML" = 1 ]; then
-    cmd+=" --sem-homologacao --prod-branch $PROD_BRANCH --ci $CI"
+    cmd+=" --no-staging --prod-branch $PROD_BRANCH --ci $CI"
   else
-    cmd+=" --dominio-hml $DOMINIO_HML --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH --ci $CI"
+    cmd+=" --staging-domain $DOMINIO_HML --prod-branch $PROD_BRANCH --staging-branch $HML_BRANCH --ci $CI"
   fi
   if [ -n "$STACK" ]; then cmd+=" --stack $STACK"; fi
-  if [ "$PORTA_APP" != 3000 ]; then cmd+=" --porta-app $PORTA_APP"; fi
+  if [ "$PORTA_APP" != 3000 ]; then cmd+=" --app-port $PORTA_APP"; fi
   if [ "$HEALTH" != /api/health ]; then cmd+=" --health $HEALTH"; fi
-  if [ "$PORTA_HML" != 3001 ] && [ "$SEM_HML" = 0 ]; then cmd+=" --porta-hml $PORTA_HML"; fi
-  if [ "$PROD_NOME" != production ]; then cmd+=" --prod-nome $PROD_NOME"; fi
-  if [ "$HML_NOME" != developer ] && [ "$SEM_HML" = 0 ]; then cmd+=" --hml-nome $HML_NOME"; fi
-  if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --substituir-ci"; fi
-  if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --sem-volume"; fi
+  if [ "$PORTA_HML" != 3001 ] && [ "$SEM_HML" = 0 ]; then cmd+=" --staging-port $PORTA_HML"; fi
+  if [ "$PROD_NOME" != production ]; then cmd+=" --prod-name $PROD_NOME"; fi
+  if [ "$HML_NOME" != developer ] && [ "$SEM_HML" = 0 ]; then cmd+=" --staging-name $HML_NOME"; fi
+  if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --replace-ci"; fi
+  if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --no-volume"; fi
   for v in "${VOLUMES[@]}"; do cmd+=" --volume $v"; done
-  for v in "${COPIAR[@]}"; do cmd+=" --copiar $v"; done
-  if [ "$LIMITE_UPLOAD" != 25m ]; then cmd+=" --limite-upload $LIMITE_UPLOAD"; fi
-  if [ -n "$IP_PROD" ]; then cmd+=" --ip-prod $IP_PROD"; fi
-  if [ "$CI" = gitlab ] && [ "$TAG_RUNNER" != "$SISTEMA" ]; then cmd+=" --tag-runner $TAG_RUNNER"; fi
+  for v in "${COPIAR[@]}"; do cmd+=" --copy $v"; done
+  if [ "$LIMITE_UPLOAD" != 25m ]; then cmd+=" --upload-limit $LIMITE_UPLOAD"; fi
+  if [ -n "$IP_PROD" ]; then cmd+=" --prod-ip $IP_PROD"; fi
+  if [ "$CI" = gitlab ] && [ "$TAG_RUNNER" != "$SISTEMA" ]; then cmd+=" --runner-tag $TAG_RUNNER"; fi
   # Alinha pelo número de letras: o %-13s do printf conta bytes e desalinha com acentos
   linha() { printf '    %s%s%*s%s %s\n' "$FRACO" "$1" $((13 - ${#1})) '' "$RESET" "$2" >/dev/tty; }
   printf '\n  %s%s Resumo%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET" >/dev/tty
@@ -966,7 +968,7 @@ if [ "$CI" = gitlab ]; then
   item "o runner da VM precisa da tag $TAG_RUNNER (ou troque tags: no .gitlab-ci.yml)"
 fi
 if [ "$SEM_HML" = 1 ]; then
-  item "commit e push na branch $PROD_BRANCH; depois, na VM: setup-host.sh com --sem-homologacao"
+  item "commit e push na branch $PROD_BRANCH; depois, na VM: setup-host.sh com --no-staging"
 else
   item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"
 fi

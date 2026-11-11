@@ -1,5 +1,20 @@
 # Changelog
 
+## Não publicado
+
+- **Opções em inglês** nos dois scripts; as perguntas e mensagens continuam em português. Os nomes antigos continuam aceitos:
+  - `--sistema` → `--system`
+  - `--dominio-prod` / `--dominio-hml` → `--prod-domain` / `--staging-domain`
+  - `--porta-app` / `--porta-hml` → `--app-port` / `--staging-port`
+  - `--prod-nome` / `--hml-nome` / `--hml-branch` → `--prod-name` / `--staging-name` / `--staging-branch`
+  - `--sem-homologacao` → `--no-staging`
+  - `--substituir-ci` / `--sem-volume` / `--copiar` → `--replace-ci` / `--no-volume` / `--copy`
+  - `--limite-upload` / `--ip-prod` / `--tag-runner` → `--upload-limit` / `--prod-ip` / `--runner-tag`
+  - `--segredos` / `--env-hml` → `--secrets` / `--env-staging`
+  - `--pg-hml` / `--pg-acesso` → `--pg-staging` / `--pg-access`
+  - `--origem` / `--sem-clone` / `--sim` → `--source` / `--no-clone` / `--yes`
+  - `--interativo` / `--nao-interativo` → `--interactive` / `--non-interactive`
+
 ## 2.0.0 (2026-11-10)
 
 Homologação e produção na mesma VM, e ferramentas para preparar a VM e o repositório.

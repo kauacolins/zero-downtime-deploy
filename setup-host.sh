@@ -16,7 +16,7 @@ SISTEMA="" PROD_NOME=production PROD_BRANCH="" HML_NOME=developer HML_BRANCH=""
 SEGREDOS="" PG_HML="" PG_URL="" PG_URL_USADA=0 CLONAR=1 DEPLOY="" SIM=0 INTERATIVO=auto
 REPOS=() PG_ACESSOS=() ENV_TODOS=() ENV_PROD=() ENV_HML=()
 SEGREDOS_PERGUNTADO=0 RETOMADO=0 ESTADO_ATIVO=0
-# Só produção (--sem-homologacao): sem clone, .env, banco nem deploy de homologação
+# Só produção (--no-staging): sem clone, .env, banco nem deploy de homologação
 SEM_HML=0 SEM_HML_DEF=0
 # Instalação atual de cada repositório (deploy antigo): "DONO/REPO=/pasta" ou só "/pasta"
 ORIGENS=()
@@ -39,38 +39,40 @@ produção na mesma máquina. Pode ser rodado de novo: cada etapa pula o que já
 Rode com o usuário do deploy (não como root), que precisa de sudo. Exemplos:
 
   # Um repositório (Siscon): /opt/siscon/{production,developer}
-  bash setup-host.sh --sistema siscon --repo SEMIT-SUAS/siscon \
-    --pg-hml siscon_hml --segredos "AUTH_SECRET NEXTAUTH_SECRET JWT_SECRET APP_ENCRYPTION_KEY" \
+  bash setup-host.sh --system siscon --repo SEMIT-SUAS/siscon \
+    --pg-staging siscon_hml --secrets "AUTH_SECRET NEXTAUTH_SECRET JWT_SECRET APP_ENCRYPTION_KEY" \
     --env NODE_ENV=production --env-prod NEXTAUTH_URL=https://siscon.saoluis.ma.gov.br \
-    --env-hml NEXTAUTH_URL=http://10.0.0.160:3001
+    --env-staging NEXTAUTH_URL=http://10.0.0.160:3001
 
   # Vários repositórios (CIS): /opt/cis/{api,frontend}/{production,homolog}
-  bash setup-host.sh --sistema cis --hml-nome homolog --hml-branch homolog \
+  bash setup-host.sh --system cis --staging-name homolog --staging-branch homolog \
     --repo SEMIT-SUAS/cis-api:api --repo SEMIT-SUAS/cis-frontend:frontend:front
 
   # GitLab (subgrupos valem): deploy key e runner ficam manuais, com passo a passo
-  bash setup-host.sh --sistema sisx --gitlab gitlab.saoluis.ma.gov.br --repo semit/sisx
+  bash setup-host.sh --system sisx --gitlab gitlab.saoluis.ma.gov.br --repo semit/sisx
 
 Opções:
-  --sistema NOME          obrigatório; as pastas ficam em /opt/NOME
-  --sem-homologacao       só produção (o repositório gerado com scaffold.sh --sem-homologacao):
+  --system NOME           obrigatório; as pastas ficam em /opt/NOME
+  --no-staging            só produção (o repositório gerado com scaffold.sh --no-staging):
                           sem clone, .env, banco nem deploy de homologação, e só a porta 80
   --repo DONO/REPO[:PASTA[:LABELS]]
                           repetível. PASTA é a subpasta em /opt/NOME (padrão: nenhuma com
                           um repositório, o nome do repositório com vários). LABELS são as
                           labels extras do runner, separadas por vírgula (ex.: front)
-  --prod-nome / --prod-branch   padrão: production / main
-  --hml-nome  / --hml-branch    padrão: developer / dev
-  --segredos "CHAVE ..."  chaves do .env que recebem segredo aleatório, se ainda
+  --prod-name / --prod-branch
+                          padrão: production / main
+  --staging-name / --staging-branch
+                          padrão: developer / dev
+  --secrets "CHAVE ..."   chaves do .env que recebem segredo aleatório, se ainda
                           estiverem com o valor do arquivo de exemplo
   --env CHAVE=VALOR       repetível; grava no .env dos dois ambientes (ex.: NODE_ENV=production)
-  --env-prod / --env-hml CHAVE=VALOR
+  --env-prod / --env-staging CHAVE=VALOR
                           repetíveis; gravam só no .env daquele ambiente (ex.: NEXTAUTH_URL)
-  --pg-hml NOME           cria banco e usuário NOME no PostgreSQL da máquina
-  --pg-acesso BANCO:USUARIO
+  --pg-staging NOME       cria banco e usuário NOME no PostgreSQL da máquina
+  --pg-access BANCO:USUARIO
                           repetível; libera o banco para a rede Docker no pg_hba.conf. Os bancos
                           do DATABASE_URL/DIRECT_URL de cada .env já são liberados sem a opção
-  --origem [DONO/REPO=]PASTA
+  --source [DONO/REPO=]PASTA
                           instalação atual do sistema na VM (ex.: o deploy antigo pelo PM2). A
                           produção recebe os valores do .env dela e os arquivos enviados pelos
                           usuários (pastas montadas), sincronizados de novo a cada execução; a
@@ -78,13 +80,13 @@ Opções:
                           interativo procura e pergunta
   --gitlab HOST           repositórios no GitLab (gitlab.com ou um servidor próprio). A deploy
                           key e o runner ficam manuais: o script mostra o passo a passo
-  --sem-clone             não clona (o workflow do sistema cria as pastas sozinho)
+  --no-clone              não clona (o workflow do sistema cria as pastas sozinho)
   --deploy                roda deploy.sh de cada pasta no final, homologação primeiro
-  --sim                   não pergunta antes de parar o PM2 ou o Nginx que ocupa as portas 80/3001
-  -i, --interativo        pergunta o que faltar, mesmo com --sistema e --repo informados
-  --nao-interativo        nunca pergunta (CI, ssh sem terminal): falta de opção é erro
+  --yes                   não pergunta antes de parar o PM2 ou o Nginx que ocupa as portas 80/3001
+  -i, --interactive       pergunta o que faltar, mesmo com --system e --repo informados
+  --non-interactive       nunca pergunta (CI, ssh sem terminal): falta de opção é erro
 
-Modo interativo: sem --sistema ou --repo e com terminal, o script pergunta o que faltar,
+Modo interativo: sem --system ou --repo e com terminal, o script pergunta o que faltar,
 com listas de escolha para branches, bancos do PostgreSQL, segredos e valores do .env.
 No fim mostra o comando equivalente, para repetir sem perguntas:
 
@@ -108,38 +110,38 @@ AJUDA
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sistema) SISTEMA="$2"; shift 2 ;;
+    --system|--sistema) SISTEMA="$2"; shift 2 ;;
     --repo) REPOS+=("$2"); shift 2 ;;
-    --prod-nome) PROD_NOME="$2"; shift 2 ;;
+    --prod-name|--prod-nome) PROD_NOME="$2"; shift 2 ;;
     --prod-branch) PROD_BRANCH="$2"; shift 2 ;;
-    --hml-nome) HML_NOME="$2"; shift 2 ;;
-    --hml-branch) HML_BRANCH="$2"; shift 2 ;;
-    --sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
-    --segredos) SEGREDOS="$2"; shift 2 ;;
+    --staging-name|--hml-nome) HML_NOME="$2"; shift 2 ;;
+    --staging-branch|--hml-branch) HML_BRANCH="$2"; shift 2 ;;
+    --no-staging|--sem-homologacao) SEM_HML=1; SEM_HML_DEF=1; shift ;;
+    --secrets|--segredos) SEGREDOS="$2"; shift 2 ;;
     --env) ENV_TODOS+=("$2"); shift 2 ;;
     --env-prod) ENV_PROD+=("$2"); shift 2 ;;
-    --env-hml) ENV_HML+=("$2"); shift 2 ;;
-    --pg-hml) PG_HML="$2"; shift 2 ;;
-    --pg-acesso) PG_ACESSOS+=("$2"); shift 2 ;;
-    --origem) ORIGENS+=("$2"); shift 2 ;;
+    --env-staging|--env-hml) ENV_HML+=("$2"); shift 2 ;;
+    --pg-staging|--pg-hml) PG_HML="$2"; shift 2 ;;
+    --pg-access|--pg-acesso) PG_ACESSOS+=("$2"); shift 2 ;;
+    --source|--origem) ORIGENS+=("$2"); shift 2 ;;
     --gitlab)
       FORGE=gitlab FORGE_DEFINIDO=1
       GIT_HOST="${2#*://}"
       GIT_HOST="${GIT_HOST%%/*}"
       shift 2
       ;;
-    --sem-clone) CLONAR=0; shift ;;
+    --no-clone|--sem-clone) CLONAR=0; shift ;;
     --deploy) DEPLOY=1; shift ;;
-    --sim) SIM=1; shift ;;
-    -i|--interativo) INTERATIVO=1; shift ;;
-    --nao-interativo) INTERATIVO=0; shift ;;
+    --yes|--sim) SIM=1; shift ;;
+    -i|--interactive|--interativo) INTERATIVO=1; shift ;;
+    --non-interactive|--nao-interativo) INTERATIVO=0; shift ;;
     -h|--help) uso ;;
     --versao|--version) echo "setup-host.sh $VERSAO"; exit 0 ;;
     *) echo "Opção desconhecida: $1" >&2; uso 1 ;;
   esac
 done
 
-# Faltou --sistema ou --repo e há terminal: pergunta em vez de parar (-i força, --nao-interativo desliga)
+# Faltou --system ou --repo e há terminal: pergunta em vez de parar (-i força, --non-interactive desliga)
 if [ "$INTERATIVO" = auto ]; then
   if { [ -z "$SISTEMA" ] || [ "${#REPOS[@]}" -eq 0 ]; } && { : </dev/tty; } 2>/dev/null; then
     INTERATIVO=1
@@ -148,7 +150,7 @@ if [ "$INTERATIVO" = auto ]; then
   fi
 fi
 if [ "$INTERATIVO" = 0 ]; then
-  [ -n "$SISTEMA" ] || { echo "Falta --sistema (ou rode num terminal para responder às perguntas)" >&2; uso 1; }
+  [ -n "$SISTEMA" ] || { echo "Falta --system (ou rode num terminal para responder às perguntas)" >&2; uso 1; }
   [ "${#REPOS[@]}" -gt 0 ] || { echo "Falta ao menos um --repo (ou rode num terminal)" >&2; uso 1; }
 fi
 
@@ -238,7 +240,7 @@ perguntar() {
   __resp_var="$resp"
 }
 
-# sim_nao "Pergunta" s|n: pergunta de configuração, que o --sim não responde sozinho
+# sim_nao "Pergunta" s|n: pergunta de configuração, que o --yes não responde sozinho
 sim_nao() {
   local resp=""
   while true; do
@@ -832,17 +834,17 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   # Comando equivalente, para repetir sem perguntas (o GH_TOKEN nunca entra aqui)
-  cmd="$CHAMADA --sistema $SISTEMA"
+  cmd="$CHAMADA --system $SISTEMA"
   [ "$FORGE" = gitlab ] && cmd+=" --gitlab $GIT_HOST"
   for r in "${REPOS[@]}"; do cmd+=" --repo $r"; done
   if [ "$SEM_HML" = 1 ]; then
-    cmd+=" --sem-homologacao --prod-branch $PROD_BRANCH"
+    cmd+=" --no-staging --prod-branch $PROD_BRANCH"
   else
-    cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
+    cmd+=" --prod-branch $PROD_BRANCH --staging-branch $HML_BRANCH"
   fi
-  [ -n "$PG_HML" ] && cmd+=" --pg-hml $PG_HML"
-  for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-acesso $a"; done
-  for a in "${ORIGENS[@]}"; do cmd+=" --origem $a"; done
+  [ -n "$PG_HML" ] && cmd+=" --pg-staging $PG_HML"
+  for a in "${PG_ACESSOS[@]}"; do cmd+=" --pg-access $a"; done
+  for a in "${ORIGENS[@]}"; do cmd+=" --source $a"; done
   [ "$DEPLOY" = 1 ] && cmd+=" --deploy"
   printf '\n  %s%s Para repetir sem perguntas:%s\n    %s%s%s\n\n' "$FRACO" "$I_INFO" "$RESET" "$CIANO" "$cmd" "$RESET"
   sim_nao "Continuar?" s || { printf '  %s%s Nada foi alterado.%s\n' "$AMARELO" "$I_AVISO" "$RESET"; exit 0; }
@@ -853,17 +855,17 @@ trap 'printf "\n\n  %s%s Interrompido em \"%s\". Rode o mesmo comando de novo pa
 PROD_BRANCH="${PROD_BRANCH:-main}" HML_BRANCH="${HML_BRANCH:-dev}" DEPLOY="${DEPLOY:-0}"
 # Ambientes em uso: AMBIENTES na ordem de preparar, ORDEM_DEPLOY com homologação primeiro
 if [ "$SEM_HML" = 1 ]; then
-  [ -z "$PG_HML" ] || falha "--pg-hml não combina com --sem-homologacao"
+  [ -z "$PG_HML" ] || falha "--pg-staging não combina com --no-staging"
   AMBIENTES=("$PROD_NOME") ORDEM_DEPLOY=("$PROD_NOME") CLONES=("$PROD_NOME:$PROD_BRANCH")
 else
   AMBIENTES=("$PROD_NOME" "$HML_NOME") ORDEM_DEPLOY=("$HML_NOME" "$PROD_NOME")
   CLONES=("$PROD_NOME:$PROD_BRANCH" "$HML_NOME:$HML_BRANCH")
 fi
 definir_portas
-[[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--sistema aceita só minúsculas, números, _ e -"
+[[ "$SISTEMA" =~ ^[a-z0-9_-]+$ ]] || falha "--system aceita só minúsculas, números, _ e -"
 BASE="/opt/$SISTEMA"
 for a in "${ORIGENS[@]}"; do
-  sudo test -d "${a#*=}" || falha "--origem: pasta não encontrada: ${a#*=}"
+  sudo test -d "${a#*=}" || falha "--source: pasta não encontrada: ${a#*=}"
 done
 ESTADO_ATIVO=1
 trap ao_sair EXIT
@@ -993,7 +995,7 @@ if [ "$CLONAR" = 1 ]; then
       if [ -d "$dest/.git" ]; then
         ok "$dest já clonado ($(git -C "$dest" branch --show-current))"
       elif ! git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1; then
-        aviso "$SLUG não tem a branch $branch: crie-a ou ajuste --prod-branch/--hml-branch ($amb não clonado)"
+        aviso "$SLUG não tem a branch $branch: crie-a ou ajuste --prod-branch/--staging-branch ($amb não clonado)"
       elif git clone -q -b "$branch" "$url" "$dest"; then
         ok "$dest clonado da branch $branch"
       else
@@ -1022,7 +1024,7 @@ for spec in "${REPOS[@]}"; do
       grep -qslE 'self-hosted' "$dest"/.github/workflows/*.y*ml || faltam+=("workflow com runs-on: self-hosted")
     fi
     if [ "$SEM_HML" = 0 ] && [ -f "$dest/nginx/default.conf" ] && ! grep -q '_hml_blue_app' "$dest/nginx/default.conf"; then
-      aviso "$SLUG ($amb): o repositório foi gerado sem homologação (scaffold.sh --sem-homologacao): rode este script com --sem-homologacao"
+      aviso "$SLUG ($amb): o repositório foi gerado sem homologação (scaffold.sh --no-staging): rode este script com --no-staging"
     fi
     if [ "${#faltam[@]}" -eq 0 ]; then
       ok "$SLUG ($amb): arquivos de deploy presentes"
@@ -1037,8 +1039,8 @@ done
 psql_pg() { sudo -u postgres psql -v ON_ERROR_STOP=1 -tAc "$1"; }
 if [ -n "$PG_HML" ]; then
   etapa "Banco de homologação"
-  [ -d /etc/postgresql ] || falha "--pg-hml: PostgreSQL não encontrado em /etc/postgresql"
-  [[ "$PG_HML" =~ ^[a-z0-9_]+$ ]] || falha "--pg-hml aceita só minúsculas, números e _"
+  [ -d /etc/postgresql ] || falha "--pg-staging: PostgreSQL não encontrado em /etc/postgresql"
+  [[ "$PG_HML" =~ ^[a-z0-9_]+$ ]] || falha "--pg-staging aceita só minúsculas, números e _"
   if [ "$(psql_pg "SELECT 1 FROM pg_roles WHERE rolname = '$PG_HML'")" != 1 ]; then
     # Hexadecimal: sem @ : / $, que quebrariam a URL ou o Compose
     senha="$(openssl rand -hex 24)"
@@ -1125,7 +1127,7 @@ for spec in "${REPOS[@]}"; do
       set_env "$env" "${kv%%=*}" "${kv#*=}"
     done
 
-    # Interativo e sem --segredos: escolhe no .env.example, já marcando os que parecem segredos
+    # Interativo e sem --secrets: escolhe no .env.example, já marcando os que parecem segredos
     if [ "$INTERATIVO" = 1 ] && [ -z "$SEGREDOS" ] && [ "$SEGREDOS_PERGUNTADO" = 0 ] && [ -n "$exemplo" ]; then
       SEGREDOS_PERGUNTADO=1
       opcoes=() marcados="" i=1 escolhidos=()
@@ -1230,7 +1232,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Acesso dos contêineres ao PostgreSQL da máquina: os bancos saem do DATABASE_URL/DIRECT_URL de
-# cada .env (os que apontam para host.docker.internal), mais os de --pg-acesso
+# cada .env (os que apontam para host.docker.internal), mais os de --pg-access
 RE_URL_PG='^postgres(ql)?://([^:@/]+)(:[^@]*)?@(host\.docker\.internal|172\.17\.0\.1)(:[0-9]+)?/([^?]+)'
 if [ -d /etc/postgresql ]; then
   etapa "Acesso ao PostgreSQL da máquina"
@@ -1303,7 +1305,7 @@ if [ "$FORGE" = gitlab ]; then
   # para usar o grupo docker e gravar em /opt sem sudo
   projetos="$(for spec in "${REPOS[@]}"; do printf '%s ' "${spec%%:*}"; done)"
   projetos="${projetos% }"
-  # Tag pedida pelos jobs de deploy no .gitlab-ci.yml já clonado (o scaffold.sh --tag-runner a define)
+  # Tag pedida pelos jobs de deploy no .gitlab-ci.yml já clonado (o scaffold.sh --runner-tag a define)
   tag_ci="$(grep -hoE '^[[:space:]]*tags:[[:space:]]*\[[^]]+\]' "$BASE"/*/*/.gitlab-ci.yml "$BASE"/*/.gitlab-ci.yml 2>/dev/null \
     | head -1 | sed -E 's/.*\[[[:space:]]*//; s/[][[:space:]]//g' || true)"
   tag_ci="${tag_ci:-$SISTEMA}"

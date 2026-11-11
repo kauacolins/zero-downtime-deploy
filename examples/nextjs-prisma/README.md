@@ -20,7 +20,7 @@ Arquivos específicos da stack, para usar junto com os [`modelos/`](../../modelo
 4. Se alguma página consulta o banco durante o build, use `export const dynamic = "force-dynamic"` nela ou no layout. O build não tem acesso ao banco nem ao `.env`.
 5. Inclua os domínios e o `IP:porta-hml` em `experimental.serverActions.allowedOrigins`, no `next.config.ts`. Sem isso, as Server Actions recusam pedidos que chegam pelo Nginx. O `scaffold.sh` avisa quando o código usa Server Actions sem essa opção.
 6. Variáveis `NEXT_PUBLIC_*` são gravadas no build, e o `.env` não entra na imagem. O `scaffold.sh` acha as usadas no código e as declara como `ARG` no `Dockerfile` e `args` nos composes, com o valor do `.env` de cada pasta.
-7. Pastas lidas em tempo de execução (ex.: `data/` com arquivos JSON) não entram no build standalone. O `scaffold.sh` as acha no código e as copia no `Dockerfile` (`--copiar`).
+7. Pastas lidas em tempo de execução (ex.: `data/` com arquivos JSON) não entram no build standalone. O `scaffold.sh` as acha no código e as copia no `Dockerfile` (`--copy`).
 
 ## Sem Prisma
 
