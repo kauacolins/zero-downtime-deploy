@@ -513,10 +513,16 @@ detectar_sistema_atual() {
     echo "    O contêiner $c ($("${DOCKER[@]}" inspect "$c" -f '{{.Config.Image}}'), de ${d:-origem desconhecida}) ocupa a(s) porta(s) $PORTAS_TXT."
   done
 
-  # Um contêiner parado chamado nginx impediria o deploy de criar o deste sistema com o mesmo nome
-  if "${DOCKER[@]}" inspect nginx >/dev/null 2>&1; then
+  # Um contêiner parado chamado nginx impediria o deploy de criar o deste sistema com o mesmo nome.
+  # O de outro sistema é renomeado (não é nosso para apagar); o deste sistema, parado, é removido:
+  # reaproveitado, ele pode ter ficado sem a porta publicada (ex.: criado com a porta 80 ocupada)
+  if "${DOCKER[@]}" inspect nginx >/dev/null 2>&1 \
+    && [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' nginx)" != true ]; then
     d="$("${DOCKER[@]}" inspect nginx -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
-    if [[ "$d" != "$BASE"* ]] && [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' nginx)" != true ]; then
+    if [[ -n "$d" && "$d" == "$BASE"* ]]; then
+      "${DOCKER[@]}" rm -f nginx >/dev/null
+      ok "Contêiner nginx parado deste sistema removido: o deploy o recria"
+    else
       "${DOCKER[@]}" rename nginx "nginx-parado-$(date +%Y%m%d)"
       ok "Contêiner nginx parado de ${d:-outro sistema} renomeado para nginx-parado-$(date +%Y%m%d) (não foi apagado)"
     fi

@@ -137,7 +137,23 @@ else
   if ss -ltnH '( sport = :80 )' 2>/dev/null | grep -q .; then
     abort "A porta 80 está ocupada por outro processo (o sistema antigo ou o Nginx da máquina?). O primeiro deploy, com um sistema antigo no ar, é pelo setup-host.sh na VM: rode-o, escolha continuar e fazer o primeiro deploy"
   fi
-  docker compose -f "$NGINX_COMPOSE" up -d || abort "O Nginx não subiu (veja a mensagem acima)"
+  # Um contêiner nginx parado não é reaproveitado: pode ter sido criado sem a porta publicada
+  # (ex.: numa tentativa com a porta 80 ocupada). O deste sistema é recriado; o de outro, não é tocado
+  if docker inspect nginx >/dev/null 2>&1; then
+    dono="$(docker inspect nginx -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    if [[ -n "$dono" && "$dono" == "/opt/$SISTEMA"* ]]; then
+      docker rm -f nginx >/dev/null
+    else
+      abort "Há um contêiner nginx parado de ${dono:-outro sistema}: renomeie-o ou remova-o (docker rename nginx nginx-antigo) e rode de novo"
+    fi
+  fi
+  docker compose -f "$NGINX_COMPOSE" up -d --force-recreate || abort "O Nginx não subiu (veja a mensagem acima)"
+  # Rodando não basta: confere que a porta 80 foi publicada de fato
+  # (sem a porta, ele sai: o próximo deploy o veria rodando e só recarregaria a configuração)
+  if ! docker port nginx 80 >/dev/null 2>&1; then
+    docker rm -f nginx >/dev/null 2>&1 || true
+    abort "O Nginx subiu sem publicar a porta 80"
+  fi
 fi
 
 if [ -n "$CURRENT" ]; then
