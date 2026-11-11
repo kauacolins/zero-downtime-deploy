@@ -23,7 +23,7 @@ COPY . .
 RUN mkdir -p public && npm run build
 
 FROM base AS runner
-ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT={{PORTA_APP}} HOSTNAME=0.0.0.0
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
@@ -31,5 +31,5 @@ COPY --from=builder /app/public ./public
 # O compose escolhe o UID (dono das pastas montadas no host); o cache do Next precisa aceitar qualquer um
 RUN mkdir -p {{PASTAS_VOLUME}} .next/cache && chmod -R a+rwX .next {{PASTAS_VOLUME}}
 USER node
-EXPOSE 3000
+EXPOSE {{PORTA_APP}}
 CMD ["node", "server.js"]

@@ -2,6 +2,10 @@
 
 ## Não publicado
 
+- **`deploy.conf`:** as respostas do `scaffold.sh` ficam no repositório; rodando de novo, o que está nele não é perguntado. `--upgrade` refaz os arquivos de deploy (os com a marca do projeto) a partir dele.
+- **Stacks com detecção:** cada pasta de `examples/` tem um `stack.conf` com a regra de detecção e os padrões; o `scaffold.sh` sugere a mais específica. Novas: `nextjs` (sem Prisma), `node`, `spa` (Vite) e `dockerfile` (o do próprio sistema, para qualquer tecnologia).
+- **`--migrate-cmd`:** migração de qualquer ORM, rodada pelo `deploy.sh` na imagem nova antes da troca.
+- Arquivos de stack em `src/` vão para a raiz em projetos sem `src/`, e `.ts` vira `.js` em projetos sem TypeScript.
 - **Opções em inglês** nos dois scripts; as perguntas e mensagens continuam em português. Os nomes antigos continuam aceitos:
   - `--sistema` → `--system`
   - `--dominio-prod` / `--dominio-hml` → `--prod-domain` / `--staging-domain`

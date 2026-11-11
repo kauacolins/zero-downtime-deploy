@@ -83,6 +83,13 @@ color "$NEXT" build
 # Migração opcional. As duas versões usam o mesmo banco durante a troca: ela precisa servir para ambas
 if [ -f compose.migrate.yml ]; then
   docker compose -p "$PROJECT-migrate" -f compose.migrate.yml run --rm --build migrate
+else
+  # Sem compose.migrate.yml: o MIGRATE_CMD do deploy.conf roda na imagem nova, com o .env do ambiente
+  MIGRATE_CMD="$(sed -n 's/^MIGRATE_CMD=//p' deploy.conf 2>/dev/null | tail -1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/" | tr -d '\r')"
+  if [ -n "$MIGRATE_CMD" ]; then
+    echo "[$ENV_NAME] Migração: $MIGRATE_CMD"
+    color "$NEXT" run --rm --no-deps -T app sh -c "$MIGRATE_CMD" </dev/null || abort "A migração falhou"
+  fi
 fi
 
 # {{CRIAR_PASTAS}}

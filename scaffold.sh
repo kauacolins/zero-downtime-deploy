@@ -36,8 +36,13 @@ Opções:
   --staging-name / --staging-branch
                               padrão: developer / dev
   --ci github|gitlab          padrão: github
-  --stack NOME                copia também os arquivos de examples/NOME (ex.: nextjs-prisma):
-                              Dockerfile, .dockerignore, migração, rota de saúde, .env.example
+  --stack NOME                copia também os arquivos de examples/NOME: nextjs-prisma, nextjs,
+                              node, spa (Vite) ou dockerfile (o Dockerfile do próprio sistema).
+                              Sem a opção, o script detecta a stack pelo repositório
+  --migrate-cmd "COMANDO"     migração do banco, rodada na imagem nova antes da troca (ex.:
+                              "php artisan migrate --force"); a stack nextjs-prisma já tem a sua
+  --upgrade                   gera de novo os arquivos de deploy (os que têm "Gerado pelo
+                              zero-downtime-deploy") a partir do deploy.conf do repositório
   --replace-ci                desativa os pipelines de deploy antigos (PM2, ssh, git pull...):
                               vão para .bak, que o CI não lê
   --force-dynamic             stack Next.js: acrescenta export const dynamic = "force-dynamic"
@@ -67,6 +72,10 @@ temporária, apagada no fim; ZDD_REF escolhe a versão, ex.: ZDD_REF=v2.0.0):
 
   bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh)
 
+As respostas ficam no deploy.conf do repositório, que vai para o git: rodando de novo, o script
+não pergunta o que já está lá. Para atualizar os arquivos de deploy depois de mudar o deploy.conf
+ou de uma versão nova deste projeto: bash scaffold.sh --upgrade.
+
 O script também lê o código: variáveis NEXT_PUBLIC_* viram argumentos de build, as usadas no
 código e ausentes do .env.example entram nele, o job de teste sai do package.json e, na stack
 Next.js, o next.config ganha output: "standalone" se faltar.
@@ -84,6 +93,10 @@ SISTEMA="" DOMINIO_PROD="" DOMINIO_HML="" PORTA_APP="" HEALTH="" PORTA_HML=""
 PROD_NOME="" PROD_BRANCH="" HML_NOME="" HML_BRANCH="" CI="" STACK="" STACK_DEFINIDA=0 DESTINO=""
 SEM_HML=0 SEM_HML_DEF=0
 INTERATIVO=auto SUBSTITUIR_CI=0 FORCE_DYNAMIC=0 CHECK_BUILD=""
+MIGRATE_CMD="" MIGRATE_DEF=0 UPGRADE=0 BUILD_ARGS_CONF=() BUILD_ARGS_DEF=0 CONF_LIDO=0
+# Da stack escolhida (examples/<stack>/stack.conf)
+STACK_NEXTJS=0 STACK_PREFIXO="" STACK_VOLUMES_PADRAO=uploads STACK_APP_PORT="" STACK_HEALTH=""
+STACK_PERGUNTAR_APP=0 STACK_PERGUNTAR_MIGRACAO=0 STACK_HEALTH_PROPRIA=0
 VOLUMES=() VOLUMES_DEF=0 COPIAR=() COPIAR_DEF=0 LIMITE_UPLOAD="" IP_PROD="" TAG_RUNNER=""
 
 while [ $# -gt 0 ]; do
@@ -103,6 +116,8 @@ while [ $# -gt 0 ]; do
     --stack) STACK="$2"; STACK_DEFINIDA=1; shift 2 ;;
     --replace-ci|--substituir-ci) SUBSTITUIR_CI=1; shift ;;
     --force-dynamic) FORCE_DYNAMIC=1; shift ;;
+    --migrate-cmd) MIGRATE_CMD="$2"; MIGRATE_DEF=1; shift 2 ;;
+    --upgrade) UPGRADE=1; shift ;;
     --check-build) CHECK_BUILD=1; shift ;;
     --no-check-build) CHECK_BUILD=0; shift ;;
     --volume) VOLUMES+=("$2"); VOLUMES_DEF=1; shift 2 ;;
@@ -367,8 +382,8 @@ detectar_copiar() {
 # Variáveis lidas pelo código (process.env.X), menos as que o ambiente já define
 ENV_IGNORAR=" NODE_ENV PORT HOSTNAME NEXT_RUNTIME NEXT_PHASE NEXT_TELEMETRY_DISABLED CI TZ HOME PWD PATH JEST_WORKER_ID "
 detectar_env() {
-  grep_fontes -hoE "process\.env\.[A-Z_][A-Z0-9_]*|process\.env\[$Q[A-Z_][A-Z0-9_]*$Q\]" \
-    | sed -E 's/^process\.env(\.|\[.)//; s/[^A-Z0-9_].*$//' | sort -u \
+  grep_fontes -hoE "(process|import\.meta)\.env\.[A-Z_][A-Z0-9_]*|process\.env\[$Q[A-Z_][A-Z0-9_]*$Q\]" \
+    | sed -E 's/^(process|import\.meta)\.env(\.|\[.)//; s/[^A-Z0-9_].*$//' | sort -u \
     | while IFS= read -r v; do
         [[ "$ENV_IGNORAR" == *" $v "* || "$v" == VERCEL* || "$v" == npm_* ]] || echo "$v"
       done
@@ -382,7 +397,13 @@ analisar_repositorio() {
   if [ -f "$DESTINO/package.json" ] && grep -q '"next"' "$DESTINO/package.json"; then IS_NEXT=1; fi
   mapfile -t DET_VOLUMES < <(detectar_volumes)
   NEXT_PUBLIC=()
-  if [ "$IS_NEXT" = 1 ]; then mapfile -t NEXT_PUBLIC < <(grep_fontes -hoE 'NEXT_PUBLIC_[A-Z0-9_]+' | sort -u); fi
+  prefixo="$STACK_PREFIXO"
+  if [ -z "$prefixo" ] && [ "$IS_NEXT" = 1 ]; then prefixo=NEXT_PUBLIC_; fi
+  if [ "$BUILD_ARGS_DEF" = 1 ]; then
+    NEXT_PUBLIC=("${BUILD_ARGS_CONF[@]}")
+  elif [ -n "$prefixo" ]; then
+    mapfile -t NEXT_PUBLIC < <(grep_fontes -hoE "${prefixo}[A-Z0-9_]+" | sort -u)
+  fi
   mapfile -t ENV_CODIGO < <(detectar_env)
 }
 
@@ -523,7 +544,140 @@ rotas_com_erro() {
   } | sed -E 's#/\([^/]*\)##g; s#^$#/#' | sort -u  # sem grupos: /(painel)/usuarios é /usuarios
 }
 
+# ---------------------------------------------------------------------------
+# deploy.conf e stack.conf: arquivos CHAVE=valor, lidos sem executar nada
+
+# valor_conf ARQUIVO CHAVE: o valor, sem as aspas de fora
+valor_conf() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/" | tr -d '\r'
+}
+tem_chave() { grep -q "^$2=" "$1" 2>/dev/null; }
+
+# Valores do deploy.conf como padrão: as opções do comando ganham
+carregar_conf() {
+  local c="$DESTINO/deploy.conf" v
+  [ -f "$c" ] || return 0
+  CONF_LIDO=1
+  [ -n "$SISTEMA" ] || SISTEMA="$(valor_conf "$c" SYSTEM)"
+  [ -n "$DOMINIO_PROD" ] || DOMINIO_PROD="$(valor_conf "$c" PROD_DOMAIN)"
+  [ -n "$DOMINIO_HML" ] || DOMINIO_HML="$(valor_conf "$c" STAGING_DOMAIN)"
+  [ -n "$PROD_BRANCH" ] || PROD_BRANCH="$(valor_conf "$c" PROD_BRANCH)"
+  [ -n "$HML_BRANCH" ] || HML_BRANCH="$(valor_conf "$c" STAGING_BRANCH)"
+  [ -n "$PROD_NOME" ] || PROD_NOME="$(valor_conf "$c" PROD_NAME)"
+  [ -n "$HML_NOME" ] || HML_NOME="$(valor_conf "$c" STAGING_NAME)"
+  [ -n "$PORTA_APP" ] || PORTA_APP="$(valor_conf "$c" APP_PORT)"
+  [ -n "$PORTA_HML" ] || PORTA_HML="$(valor_conf "$c" STAGING_PORT)"
+  [ -n "$HEALTH" ] || HEALTH="$(valor_conf "$c" HEALTH)"
+  [ -n "$CI" ] || CI="$(valor_conf "$c" CI)"
+  [ -n "$LIMITE_UPLOAD" ] || LIMITE_UPLOAD="$(valor_conf "$c" UPLOAD_LIMIT)"
+  [ -n "$IP_PROD" ] || IP_PROD="$(valor_conf "$c" PROD_IP)"
+  [ -n "$TAG_RUNNER" ] || TAG_RUNNER="$(valor_conf "$c" RUNNER_TAG)"
+  if [ "$SEM_HML_DEF" = 0 ] && tem_chave "$c" NO_STAGING; then
+    [ "$(valor_conf "$c" NO_STAGING)" = 1 ] && SEM_HML=1
+    SEM_HML_DEF=1
+  fi
+  if [ "$STACK_DEFINIDA" = 0 ] && tem_chave "$c" STACK; then STACK="$(valor_conf "$c" STACK)"; STACK_DEFINIDA=1; fi
+  if [ "$VOLUMES_DEF" = 0 ] && tem_chave "$c" VOLUMES; then read -ra VOLUMES <<<"$(valor_conf "$c" VOLUMES)"; VOLUMES_DEF=1; fi
+  if [ "$COPIAR_DEF" = 0 ] && tem_chave "$c" COPY; then read -ra COPIAR <<<"$(valor_conf "$c" COPY)"; COPIAR_DEF=1; fi
+  if tem_chave "$c" BUILD_ARGS; then read -ra BUILD_ARGS_CONF <<<"$(valor_conf "$c" BUILD_ARGS)"; BUILD_ARGS_DEF=1; fi
+  if [ "$MIGRATE_DEF" = 0 ] && tem_chave "$c" MIGRATE_CMD; then MIGRATE_CMD="$(valor_conf "$c" MIGRATE_CMD)"; MIGRATE_DEF=1; fi
+  printf '  %s%s Lendo %s: o que já está lá não é perguntado%s\n' "$FRACO" "$I_INFO" "deploy.conf" "$RESET" >&2
+}
+
+# Pontos de uma stack para o repositório (0: não bate). Cada regra arquivo:texto precisa bater;
+# regra com texto vale 2, só com arquivo vale 1: a stack mais específica ganha
+pontuar_stack() {
+  local conf="$1/stack.conf" regra arq texto pontos=0
+  for regra in $(valor_conf "$conf" DETECTA); do
+    arq="${regra%%:*}" texto="${regra#*:}"
+    [ -f "$DESTINO/$arq" ] || { echo 0; return 0; }
+    if [ -n "$texto" ]; then
+      grep -qF -- "$texto" "$DESTINO/$arq" || { echo 0; return 0; }
+      pontos=$((pontos + 2))
+    else
+      pontos=$((pontos + 1))
+    fi
+  done
+  echo "$pontos"
+}
+
+# Stack mais provável: mais pontos; no empate, maior PRIORIDADE
+detectar_stack() {
+  local d nome pontos prio melhor="" mp=0 mprio=-1
+  for d in "$AQUI"/examples/*/; do
+    [ -f "$d/stack.conf" ] || continue
+    nome="$(basename "$d")"
+    pontos="$(pontuar_stack "$d")"
+    prio="$(valor_conf "$d/stack.conf" PRIORIDADE)"
+    prio="${prio:-0}"
+    if [ "$pontos" -gt "$mp" ] || { [ "$pontos" -gt 0 ] && [ "$pontos" = "$mp" ] && [ "$prio" -gt "$mprio" ]; }; then
+      melhor="$nome" mp="$pontos" mprio="$prio"
+    fi
+  done
+  echo "$melhor"
+}
+
+# Padrões e comportamentos da stack escolhida
+carregar_stack() {
+  local conf="$AQUI/examples/$STACK/stack.conf"
+  STACK_NEXTJS=0 STACK_PREFIXO="" STACK_VOLUMES_PADRAO=uploads STACK_APP_PORT="" STACK_HEALTH=""
+  STACK_PERGUNTAR_APP=0 STACK_PERGUNTAR_MIGRACAO=0 STACK_HEALTH_PROPRIA=0
+  [ -n "$STACK" ] && [ -f "$conf" ] || return 0
+  STACK_NEXTJS="$(valor_conf "$conf" NEXTJS)"; STACK_NEXTJS="${STACK_NEXTJS:-0}"
+  STACK_PREFIXO="$(valor_conf "$conf" BUILD_ARGS_PREFIXO)"
+  STACK_VOLUMES_PADRAO="$(valor_conf "$conf" VOLUMES_PADRAO)"
+  STACK_APP_PORT="$(valor_conf "$conf" APP_PORT)"
+  STACK_HEALTH="$(valor_conf "$conf" HEALTH)"
+  STACK_PERGUNTAR_APP="$(valor_conf "$conf" PERGUNTAR_APP)"; STACK_PERGUNTAR_APP="${STACK_PERGUNTAR_APP:-0}"
+  STACK_PERGUNTAR_MIGRACAO="$(valor_conf "$conf" PERGUNTAR_MIGRACAO)"; STACK_PERGUNTAR_MIGRACAO="${STACK_PERGUNTAR_MIGRACAO:-0}"
+  STACK_HEALTH_PROPRIA="$(valor_conf "$conf" HEALTH_PROPRIA)"; STACK_HEALTH_PROPRIA="${STACK_HEALTH_PROPRIA:-0}"
+}
+
+# Grava o deploy.conf com as respostas desta execução
+escrever_conf() {
+  local c="$DESTINO/deploy.conf" novo=1
+  [ -f "$c" ] && novo=0
+  aspas() { if [[ "$1" == *'"'* ]]; then printf "'%s'" "$1"; else printf '"%s"' "$1"; fi; }
+  {
+    echo "# zero-downtime-deploy: configuração do deploy deste sistema. Vai no git, sem segredos"
+    echo "# (os segredos ficam no .env de cada pasta na VM). Depois de mudar algo aqui, gere de novo"
+    echo "# os arquivos de deploy: bash scaffold.sh --upgrade"
+    echo "SYSTEM=$SISTEMA"
+    echo "PROD_DOMAIN=$DOMINIO_PROD"
+    echo "PROD_BRANCH=$PROD_BRANCH"
+    echo "PROD_NAME=$PROD_NOME"
+    echo "# 1: só produção, sem homologação"
+    echo "NO_STAGING=$SEM_HML"
+    echo "STAGING_DOMAIN=$DOMINIO_HML"
+    echo "STAGING_BRANCH=$HML_BRANCH"
+    echo "STAGING_NAME=$HML_NOME"
+    echo "STAGING_PORT=$PORTA_HML"
+    echo "APP_PORT=$PORTA_APP"
+    echo "HEALTH=$HEALTH"
+    echo "CI=$CI"
+    echo "RUNNER_TAG=$TAG_RUNNER"
+    echo "# Pasta de examples/ no zero-downtime-deploy; vazio: nenhuma"
+    echo "STACK=$STACK"
+    echo "# Pastas onde a aplicação grava arquivos, montadas fora do contêiner"
+    echo "VOLUMES=$(aspas "${VOLUMES[*]}")"
+    echo "# Pastas lidas em tempo de execução, copiadas para a imagem"
+    echo "COPY=$(aspas "${COPIAR[*]}")"
+    echo "# Variáveis gravadas no build, com o valor do .env de cada pasta"
+    echo "BUILD_ARGS=$(aspas "${NEXT_PUBLIC[*]}")"
+    echo "# Migração do banco, rodada na imagem nova antes da troca (o deploy.sh lê daqui)"
+    echo "MIGRATE_CMD=$(aspas "$MIGRATE_CMD")"
+    echo "UPLOAD_LIMIT=$LIMITE_UPLOAD"
+    echo "PROD_IP=$IP_PROD"
+  } >"$c"
+  if [ "$novo" = 1 ]; then
+    printf '  %s%s%s deploy.conf\n' "$VERDE" "$I_NOVO" "$RESET"
+  else
+    printf '  %s↻%s deploy.conf\n' "$CIANO" "$RESET"
+  fi
+}
+
 # Faltou algo obrigatório e há terminal: pergunta em vez de parar
+if [ -n "$DESTINO" ]; then DESTINO="${DESTINO/#\~/$HOME}"; carregar_conf; fi
 if [ "$INTERATIVO" = auto ]; then
   if { [ -z "$SISTEMA" ] || [ -z "$DOMINIO_PROD" ] || { [ -z "$DOMINIO_HML" ] && [ "$SEM_HML" = 0 ]; } || [ -z "$DESTINO" ]; } \
     && { : </dev/tty; } 2>/dev/null; then
@@ -567,6 +721,7 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
   DESTINO="${DESTINO/#\~/$HOME}"
   [ -d "$DESTINO" ] || falha "pasta não encontrada: $DESTINO"
+  [ "$CONF_LIDO" = 1 ] || carregar_conf
 
   # O que dá para descobrir no próprio repositório
   remoto="$(git -C "$DESTINO" remote get-url origin 2>/dev/null || true)"
@@ -622,25 +777,33 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   if [ "$STACK_DEFINIDA" = 0 ]; then
-    detectada=""
-    if [ -f "$DESTINO/package.json" ] && grep -q '"next"' "$DESTINO/package.json" \
-      && grep -q '"prisma"' "$DESTINO/package.json"; then
-      detectada=nextjs-prisma
-    fi
+    detectada="$(detectar_stack)"
     opcoes=() n=0 i=1
     for d in "$AQUI"/examples/*/; do
+      [ -f "$d/stack.conf" ] || continue
       nome="$(basename "$d")"
+      desc="$(valor_conf "$d/stack.conf" DESCRICAO)"
       if [ "$nome" = "$detectada" ]; then
-        opcoes+=("$nome|$nome (detectada no repositório)")
+        opcoes+=("$nome|$nome: $desc  $CIANO(detectada)$RESET")
         n=$i
       else
-        opcoes+=("$nome|$nome")
+        opcoes+=("$nome|$nome: $FRACO$desc$RESET")
       fi
       i=$((i + 1))
     done
     opcoes+=("|nenhuma (Dockerfile, rota de saúde e migração ficam com você)")
     [ "$n" = 0 ] && n=$i
-    escolher STACK "Stack do sistema (copia Dockerfile, migração e rota de saúde prontos)" "$n" "${opcoes[@]}"
+    escolher STACK "Stack do sistema" "$n" "${opcoes[@]}"
+  fi
+  carregar_stack
+  # Dockerfile próprio: porta e rota de saúde vêm do sistema
+  if [ "$STACK_PERGUNTAR_APP" = 1 ]; then
+    perguntar PORTA_APP "Porta em que a aplicação ouve dentro do contêiner" "${PORTA_APP:-$STACK_APP_PORT}" '^[0-9]+$'
+    perguntar HEALTH "Rota de saúde (200 só com a aplicação pronta, sem login)" "${HEALTH:-$STACK_HEALTH}" '^/'
+  fi
+  if [ "$STACK_PERGUNTAR_MIGRACAO" = 1 ] && [ "$MIGRATE_DEF" = 0 ]; then
+    perguntar MIGRATE_CMD "Comando de migração do banco, rodado na imagem nova antes da troca (Enter: nenhum)" "" '^.*$'
+    MIGRATE_DEF=1
   fi
 
   analisar_repositorio
@@ -651,13 +814,13 @@ if [ "$INTERATIVO" = 1 ]; then
       escolher_varios VOLUMES "Pastas onde a aplicação grava arquivos (montadas fora do contêiner, não se perdem no deploy)" "$MARCADOS" "${OPCOES[@]}"
       perguntar extra "Outras pastas, separadas por espaço (Enter: nenhuma)" "" '^[A-Za-z0-9._/ -]*$'
     else
-      perguntar extra "Pastas onde a aplicação grava arquivos, separadas por espaço (0: nenhuma)" uploads '^([A-Za-z0-9._/ -]+|0)$'
+      perguntar extra "Pastas onde a aplicação grava arquivos, separadas por espaço (0: nenhuma)" "${STACK_VOLUMES_PADRAO:-0}" '^([A-Za-z0-9._/ -]+|0)$'
       [ "$extra" != 0 ] || extra=""
     fi
     for v in $extra; do VOLUMES+=("$v"); done
     VOLUMES_DEF=1
   fi
-  if [[ "$STACK" == nextjs* ]] && [ "$COPIAR_DEF" = 0 ]; then
+  if [ "$STACK_NEXTJS" = 1 ] && [ "$COPIAR_DEF" = 0 ]; then
     mapfile -t det_copiar < <(detectar_copiar)
     if [ "${#det_copiar[@]}" -gt 0 ]; then
       todas_marcadas "${det_copiar[@]}"
@@ -671,9 +834,9 @@ if [ "$INTERATIVO" = 1 ]; then
     fi
   fi
 
-  if sim_nao "Ajustar portas, rota de saúde, limite de upload ou nomes dos ambientes? (padrões: 3000, /api/health, 3001, 25m, production, developer)" n; then
-    perguntar PORTA_APP "Porta da aplicação dentro do contêiner" "${PORTA_APP:-3000}" '^[0-9]+$'
-    perguntar HEALTH "Rota de saúde (200 só com a aplicação pronta, sem login)" "${HEALTH:-/api/health}" '^/'
+  if sim_nao "Ajustar portas, rota de saúde, limite de upload ou nomes dos ambientes? (agora: ${PORTA_APP:-${STACK_APP_PORT:-3000}}, ${HEALTH:-${STACK_HEALTH:-/api/health}}, ${PORTA_HML:-3001}, ${LIMITE_UPLOAD:-25m}, ${PROD_NOME:-production}, ${HML_NOME:-developer})" n; then
+    perguntar PORTA_APP "Porta da aplicação dentro do contêiner" "${PORTA_APP:-${STACK_APP_PORT:-3000}}" '^[0-9]+$'
+    perguntar HEALTH "Rota de saúde (200 só com a aplicação pronta, sem login)" "${HEALTH:-${STACK_HEALTH:-/api/health}}" '^/'
     if [ "$SEM_HML" = 0 ]; then perguntar PORTA_HML "Porta de homologação na VM" "${PORTA_HML:-3001}" '^[0-9]+$'; fi
     perguntar LIMITE_UPLOAD "Maior envio aceito pelo Nginx (um pouco acima do limite da aplicação)" "${LIMITE_UPLOAD:-25m}" '^[0-9]+[kKmMgG]?$'
     perguntar PROD_NOME "Nome do ambiente de produção (pasta na VM)" "${PROD_NOME:-production}" '^[a-z0-9_-]+$'
@@ -681,19 +844,24 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 fi
 
-PORTA_APP="${PORTA_APP:-3000}" HEALTH="${HEALTH:-/api/health}" PORTA_HML="${PORTA_HML:-3001}"
+PORTA_HML="${PORTA_HML:-3001}"
 PROD_NOME="${PROD_NOME:-production}" PROD_BRANCH="${PROD_BRANCH:-main}"
 HML_NOME="${HML_NOME:-developer}" HML_BRANCH="${HML_BRANCH:-dev}" CI="${CI:-github}"
 
+if [ "$UPGRADE" = 1 ] && [ "$CONF_LIDO" = 0 ] && [ "$INTERATIVO" = 0 ]; then
+  echo "--upgrade: $DESTINO/deploy.conf não existe. Rode num terminal (o script pergunta) ou passe as opções." >&2
+fi
 [ -n "$SISTEMA" ] && [ -n "$DOMINIO_PROD" ] && { [ -n "$DOMINIO_HML" ] || [ "$SEM_HML" = 1 ]; } && [ -n "$DESTINO" ] || uso 1
 [[ "$SISTEMA" =~ ^[a-z0-9_]+$ ]] || { echo "--system aceita só minúsculas, números e _ (vira nome de contêiner)" >&2; exit 1; }
 [[ "$CI" =~ ^(github|gitlab)$ ]] || { echo "--ci aceita github ou gitlab" >&2; exit 1; }
 [ -d "$DESTINO" ] || { echo "Pasta não encontrada: $DESTINO" >&2; exit 1; }
 [ -d "$AQUI/modelos" ] || { echo "Pasta modelos/ não encontrada ao lado do script" >&2; exit 1; }
-if [ -n "$STACK" ] && [ ! -d "$AQUI/examples/$STACK" ]; then
+if [ -n "$STACK" ] && [ ! -f "$AQUI/examples/$STACK/stack.conf" ]; then
   echo "Stack desconhecida: $STACK. Disponíveis: $(ls "$AQUI/examples" | tr '\n' ' ')" >&2
   exit 1
 fi
+carregar_stack
+PORTA_APP="${PORTA_APP:-${STACK_APP_PORT:-3000}}" HEALTH="${HEALTH:-${STACK_HEALTH:-/api/health}}"
 LIMITE_UPLOAD="${LIMITE_UPLOAD:-25m}" TAG_RUNNER="${TAG_RUNNER:-$SISTEMA}"
 [[ "$LIMITE_UPLOAD" =~ ^[0-9]+[kKmMgG]?$ ]] || falha "--upload-limit aceita um tamanho como 12m"
 [ -z "$IP_PROD" ] || [[ "$IP_PROD" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || falha "--prod-ip aceita um IPv4"
@@ -701,14 +869,14 @@ LIMITE_UPLOAD="${LIMITE_UPLOAD:-25m}" TAG_RUNNER="${TAG_RUNNER:-$SISTEMA}"
 
 [ -n "$FONTES" ] || analisar_repositorio
 if [ "$VOLUMES_DEF" = 0 ]; then
-  if [ "${#DET_VOLUMES[@]}" -gt 0 ]; then VOLUMES=("${DET_VOLUMES[@]}"); else VOLUMES=(uploads); fi
+  if [ "${#DET_VOLUMES[@]}" -gt 0 ]; then VOLUMES=("${DET_VOLUMES[@]}"); else read -ra VOLUMES <<<"$STACK_VOLUMES_PADRAO"; fi
 fi
 # Caminhos relativos à raiz do repositório, sem ./ nem / no fim
 for i in "${!VOLUMES[@]}"; do
   v="${VOLUMES[$i]#./}"; v="${v%/}"; VOLUMES[$i]="$v"
   [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "$v" != *..* ]] || falha "pasta inválida em --volume: $v"
 done
-if [[ "$STACK" == nextjs* ]] && [ "$COPIAR_DEF" = 0 ]; then mapfile -t COPIAR < <(detectar_copiar); fi
+if [ "$STACK_NEXTJS" = 1 ] && [ "$COPIAR_DEF" = 0 ]; then mapfile -t COPIAR < <(detectar_copiar); fi
 for v in "${COPIAR[@]}"; do
   [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "$v" != *..* ]] || falha "pasta inválida em --copy: $v"
 done
@@ -735,7 +903,7 @@ fi
 
 # Páginas que consultam o banco e quebrariam o next build
 FORCE_PAGINAS=() PAGINAS_BANCO=()
-if [[ "$STACK" == nextjs* ]]; then
+if [ "$STACK_NEXTJS" = 1 ]; then
   mapfile -t PAGINAS_BANCO < <(detectar_paginas_com_banco)
   if [ "${#PAGINAS_BANCO[@]}" -gt 0 ]; then
     if [ "$FORCE_DYNAMIC" = 1 ]; then
@@ -771,6 +939,8 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "$HML_NOME" != developer ] && [ "$SEM_HML" = 0 ]; then cmd+=" --staging-name $HML_NOME"; fi
   if [ "$SUBSTITUIR_CI" = 1 ]; then cmd+=" --replace-ci"; fi
   if [ "$FORCE_DYNAMIC" = 1 ]; then cmd+=" --force-dynamic"; fi
+  if [ -n "$MIGRATE_CMD" ]; then cmd+=" --migrate-cmd $(printf '%q' "$MIGRATE_CMD")"; fi
+  if [ "$UPGRADE" = 1 ]; then cmd+=" --upgrade"; fi
   if [ "$CHECK_BUILD" = 1 ]; then cmd+=" --check-build"; fi
   if [ "${#VOLUMES[@]}" -eq 0 ]; then cmd+=" --no-volume"; fi
   for v in "${VOLUMES[@]}"; do cmd+=" --volume $v"; done
@@ -793,6 +963,8 @@ if [ "$INTERATIVO" = 1 ]; then
   if [ "${#FORCE_PAGINAS[@]}" -gt 0 ]; then linha "Páginas" "${#FORCE_PAGINAS[@]} com force-dynamic"; fi
   if [ "$CHECK_BUILD" = 1 ]; then linha "Validação" "docker build no fim"; fi
   linha Stack "${STACK:-nenhuma}"
+  if [ -n "$MIGRATE_CMD" ]; then linha Migração "$MIGRATE_CMD"; elif [ -f "$AQUI/examples/$STACK/compose.migrate.yml" ]; then linha Migração "da stack (compose.migrate.yml)"; fi
+  if [ "$UPGRADE" = 1 ]; then linha Upgrade "arquivos gerados pelo zero-downtime-deploy são refeitos"; fi
   linha Volumes "${VOLUMES[*]:-nenhum}  ${FRACO}(montados fora do contêiner)$RESET"
   if [ "${#COPIAR[@]}" -gt 0 ]; then linha "Na imagem" "${COPIAR[*]}"; fi
   if [ "${#NEXT_PUBLIC[@]}" -gt 0 ]; then linha "Build args" "${NEXT_PUBLIC[*]}"; fi
@@ -853,7 +1025,10 @@ montar_blocos() {
   BLOCO_VOLUMES="" BLOCO_CRIAR_PASTAS="" BLOCO_BUILD_ARGS="" BLOCO_BUILD_ARGS_DOCKERFILE=""
   BLOCO_COPIAR_PASTAS="" BLOCO_HML_PORTA_80="" BLOCO_TESTE_SCRIPT="" BLOCO_TESTE_PASSOS=""
 
+  BLOCO_CRIAR_PASTAS_DOCKERFILE=""
   if [ "${#VOLUMES[@]}" -gt 0 ]; then
+    BLOCO_CRIAR_PASTAS_DOCKERFILE="# Pastas montadas: o compose escolhe o UID (dono delas no host), então qualquer um grava"
+    BLOCO_CRIAR_PASTAS_DOCKERFILE+="${NL}RUN mkdir -p ${VOLUMES[*]} && chmod -R a+rwX ${VOLUMES[*]}"
     BLOCO_VOLUMES="    volumes:"
     for v in "${VOLUMES[@]}"; do BLOCO_VOLUMES+="$NL      - ./$v:/app/$v"; done
     BLOCO_CRIAR_PASTAS="# Pastas montadas como volume: criadas aqui, com o dono certo (o Docker as criaria como root)"
@@ -863,8 +1038,8 @@ montar_blocos() {
   fi
 
   if [ "${#NEXT_PUBLIC[@]}" -gt 0 ]; then
-    BLOCO_BUILD_ARGS="      # NEXT_PUBLIC_* são gravadas no build: o valor vem do .env desta pasta${NL}      args:"
-    BLOCO_BUILD_ARGS_DOCKERFILE="# NEXT_PUBLIC_* são gravadas no build; o compose as passa a partir do .env de cada pasta"
+    BLOCO_BUILD_ARGS="      # Variáveis gravadas no build: o valor vem do .env desta pasta${NL}      args:"
+    BLOCO_BUILD_ARGS_DOCKERFILE="# Variáveis gravadas no build; o compose as passa a partir do .env de cada pasta"
     for v in "${NEXT_PUBLIC[@]}"; do
       BLOCO_BUILD_ARGS+="$NL        $v: \${$v:-}"
       BLOCO_BUILD_ARGS_DOCKERFILE+="${NL}ARG $v"
@@ -894,7 +1069,7 @@ montar_blocos() {
     BLOCO_TESTE_SCRIPT="    # Testes do sistema aqui (ex.: ./mvnw verify)$NL    - echo \"sem testes configurados\""
     BLOCO_TESTE_PASSOS="      # Testes do sistema aqui (ex.: ./mvnw verify)$NL      - run: echo \"sem testes configurados\""
   fi
-  export BLOCO_VOLUMES BLOCO_CRIAR_PASTAS BLOCO_BUILD_ARGS BLOCO_BUILD_ARGS_DOCKERFILE \
+  export BLOCO_VOLUMES BLOCO_CRIAR_PASTAS BLOCO_BUILD_ARGS BLOCO_BUILD_ARGS_DOCKERFILE BLOCO_CRIAR_PASTAS_DOCKERFILE \
     BLOCO_COPIAR_PASTAS BLOCO_HML_PORTA_80 BLOCO_TESTE_SCRIPT BLOCO_TESTE_PASSOS
 }
 
@@ -999,7 +1174,22 @@ ajustar_next_config() {
 }
 
 gerar() {
-  local origem="$1" destino="$DESTINO/$2"
+  local origem="$1" destino="$DESTINO/$2" tmp
+  # --upgrade: refaz só o que este projeto gerou (tem a marca); o resto é do sistema
+  if [ -e "$destino" ] && [ "$UPGRADE" = 1 ] && grep -q "Gerado pelo zero-downtime-deploy" "$destino"; then
+    tmp="$(mktemp)"
+    preencher < "$AQUI/modelos/$origem" > "$tmp"
+    if cmp -s "$tmp" "$destino"; then
+      printf '  %s%s %s  (igual)%s\n' "$FRACO" "$I_MANTIDO" "$2" "$RESET"
+      MANTIDOS=$((MANTIDOS + 1))
+    else
+      cat "$tmp" > "$destino"
+      printf '  %s↻%s %s  (atualizado)\n' "$CIANO" "$RESET" "$2"
+      ATUALIZADOS=$((ATUALIZADOS + 1))
+    fi
+    rm -f "$tmp"
+    return
+  fi
   if [ -e "$destino" ]; then
     printf '  %s%s %s  (já existe, mantido)%s\n' "$FRACO" "$I_MANTIDO" "$2" "$RESET"
     MANTIDOS=$((MANTIDOS + 1))
@@ -1015,7 +1205,7 @@ montar_testes
 montar_blocos
 export SEM_HML
 if [ "$SEM_HML" = 1 ]; then BRANCHES="$PROD_BRANCH"; else BRANCHES="$PROD_BRANCH, $HML_BRANCH"; fi
-CRIADOS=0 MANTIDOS=0
+CRIADOS=0 MANTIDOS=0 ATUALIZADOS=0
 printf '%s%s Gerando em %s%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$DESTINO" "$RESET"
 gerar deploy.sh deploy.sh
 chmod +x "$DESTINO/deploy.sh" 2>/dev/null || true
@@ -1037,7 +1227,16 @@ if [ -n "$STACK" ]; then
   while IFS= read -r arquivo; do
     rel="${arquivo#"$ex"/}"
     case "$rel" in
-      README.md) continue ;;
+      README.md | stack.conf) continue ;;
+      src/*)
+        # Projeto sem src/ (app/ e lib/ na raiz): o Next ignoraria src/app, e a rota de saúde não existiria
+        if [ ! -d "$DESTINO/src" ] && { [ -d "$DESTINO/app" ] || [ -d "$DESTINO/lib" ]; }; then rel="${rel#src/}"; fi
+        # Projeto em JavaScript: um .ts faria o Next exigir TypeScript e parar o build. Os arquivos
+        # das stacks não têm anotação de tipo, então servem como .js
+        if [ ! -f "$DESTINO/tsconfig.json" ]; then
+          case "$rel" in *.tsx) rel="${rel%.tsx}.jsx" ;; *.ts) rel="${rel%.ts}.js" ;; esac
+        fi
+        ;;
       gitignore)
         # Linhas que faltam no .gitignore do sistema
         while IFS= read -r linha; do
@@ -1068,10 +1267,14 @@ if [ "${#VOLUMES[@]}" -gt 0 ]; then
   done
 fi
 
+printf '%s%s Configuração%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
+escrever_conf
+if [ -f "$DESTINO/.dockerignore" ]; then garantir_ignorado .dockerignore deploy.conf; fi
+
 printf '%s%s Código%s\n' "$NEGRITO$AZUL" "$I_ETAPA" "$RESET"
 completar_env_example
 NEXT_STANDALONE=""
-if [[ "$STACK" == nextjs* ]]; then ajustar_next_config; fi
+if [ "$STACK_NEXTJS" = 1 ]; then ajustar_next_config; fi
 for f in "${FORCE_PAGINAS[@]}"; do aplicar_force_dynamic "$f"; done
 if [ "$ENV_NOVAS" = 0 ] && [ "$NEXT_STANDALONE" != adicionado ]; then
   printf '  %s%s nada a ajustar%s\n' "$FRACO" "$I_MANTIDO" "$RESET"
@@ -1122,6 +1325,9 @@ if grep -rnoE '\{\{[A-Z_]+\}\}' "$DESTINO"/deploy.sh "$DESTINO"/compose.*.yml "$
 fi
 
 echo
+if [ "$ATUALIZADOS" -gt 0 ]; then
+  printf '%s%s %d arquivo(s) atualizado(s) pelo --upgrade: revise com git diff%s\n' "$CIANO" "$I_OK" "$ATUALIZADOS" "$RESET"
+fi
 printf '%s%s %d arquivo(s) criado(s)%s%s\n' "$VERDE" "$I_OK" "$CRIADOS" "$RESET" \
   "$([ "$MANTIDOS" -gt 0 ] && echo "$FRACO, $MANTIDOS já existiam e foram mantidos$RESET")"
 echo
@@ -1136,12 +1342,18 @@ if [ -z "$STACK" ]; then
   fi
 else
   item "revisar os arquivos copiados de examples/$STACK (veja o README da stack)"
+  if [ "$STACK_HEALTH_PROPRIA" = 1 ]; then
+    item "a rota $HEALTH, respondendo 200 só com a aplicação pronta, na porta $PORTA_APP (e sem exigir login)"
+  fi
+  if [ "$STACK" = dockerfile ]; then
+    item "no Dockerfile: WORKDIR /app (os volumes montam em /app/<pasta>) e wget, curl ou node na imagem (health check)"
+  fi
 fi
 if [ "$NEXT_STANDALONE" = falta ]; then
   item "next.config: acrescentar output: \"standalone\" (não consegui fazer sozinho)"
 fi
 # Server Actions recusam pedidos de origem que não esteja em allowedOrigins: confere uma por uma
-if [[ "$STACK" == nextjs* ]] && tem_no_codigo "${Q}use server$Q"; then
+if [ "$STACK_NEXTJS" = 1 ] && tem_no_codigo "${Q}use server$Q"; then
   necessarias=("$DOMINIO_PROD")
   if [ "$SEM_HML" = 0 ]; then
     necessarias+=("$DOMINIO_HML:$PORTA_HML")
@@ -1188,7 +1400,7 @@ done
 if [ "${#OBSOLETOS[@]}" -gt 0 ]; then
   item "obsoletos com o deploy novo, apague depois da troca na VM: ${OBSOLETOS[*]}"
 fi
-if [[ "$STACK" == nextjs* ]]; then
+if [ "$STACK_NEXTJS" = 1 ]; then
   for f in "${PAGINAS_BANCO[@]}"; do
     printf '%s\n' "${FORCE_PAGINAS[@]}" | grep -qxF "$f" && continue
     item "$f consulta o banco e seria gerada no build (sem banco): use export const dynamic = \"force-dynamic\" (--force-dynamic)"

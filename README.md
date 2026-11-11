@@ -6,7 +6,7 @@ Deploy **blue-green** com **homologação e produção na mesma VM**, para qualq
 | --- | --- | --- |
 | [`setup-host.sh`](setup-host.sh) | Na VM | Prepara a VM para um sistema: Docker, pastas, `.env`, banco de homologação, runner |
 | [`scaffold.sh`](scaffold.sh) | Na sua máquina | Gera no repositório do sistema os arquivos de deploy, a partir dos [`modelos/`](modelos) |
-| [`examples/`](examples) | | Arquivos específicos de cada stack, como o [`Dockerfile` de Next.js com Prisma](examples/nextjs-prisma) |
+| [`examples/`](examples) | | Stacks: os arquivos e os padrões de cada tecnologia. Veja [Stacks](#stacks) |
 
 A versão 1, com um ambiente só em `/var/www/app`, continua na tag `v1.0.0`. Veja o [CHANGELOG](CHANGELOG.md).
 
@@ -86,7 +86,33 @@ No fim, com Docker na máquina, o script pode validar a imagem com `docker build
 
 Homologação só com IP atende apenas na porta de homologação; o IP na porta 80 é recusado, a menos que `--prod-ip` o mande para a produção. `--upload-limit` ajusta o maior envio aceito pelo Nginx (padrão `25m`) e, no GitLab, `--runner-tag` define a tag do runner da VM (padrão: o nome do sistema).
 
-O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja [Next.js com Prisma](examples/nextjs-prisma)) e faça o commit nas branches de produção e de homologação.
+O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi gerado, faça os ajustes da stack (veja o README dela em `examples/`) e faça o commit nas branches de produção e de homologação.
+
+### `deploy.conf` e `--upgrade`
+
+As respostas ficam no `deploy.conf`, na raiz do repositório. Ele vai para o git e não tem segredos: os segredos ficam no `.env` de cada pasta na VM. Rodando o `scaffold.sh` de novo, o que está no `deploy.conf` não é perguntado.
+
+Para mudar algo (porta, domínio, pastas montadas, limite de upload) ou trazer os modelos de uma versão nova deste projeto, edite o `deploy.conf` e rode com `--upgrade`. Ele refaz só os arquivos com a marca "Gerado pelo zero-downtime-deploy" e mostra o que mudou; revise com `git diff` antes do commit. O `Dockerfile` e os outros arquivos da stack são do sistema e não são tocados.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh) --upgrade
+```
+
+### Stacks
+
+O `scaffold.sh` detecta a stack pelo repositório e sugere a mais específica:
+
+| Stack | Quando | O que traz |
+| --- | --- | --- |
+| [`nextjs-prisma`](examples/nextjs-prisma) | `package.json` com `next` e `prisma` | Next standalone, migração do Prisma (`compose.migrate.yml`), rota de saúde que consulta o banco |
+| [`nextjs`](examples/nextjs) | `package.json` com `next` | Next standalone, rota de saúde |
+| [`node`](examples/node) | `package.json` | `npm run build` (se houver) e `npm start`; a rota de saúde fica com o sistema |
+| [`spa`](examples/spa) | `package.json` com `vite` | Build servido por Nginx sem root, rotas do navegador no `index.html`, `VITE_*` no build |
+| [`dockerfile`](examples/dockerfile) | Um `Dockerfile` no repositório | Nada é copiado: pergunta a porta, a rota de saúde e a migração. Serve para PHP, Python, Java, Go... |
+
+Migração sem Prisma: `--migrate-cmd` (ex.: `php artisan migrate --force`, `alembic upgrade head`, `npm run migrate`). O comando vai para o `deploy.conf`, e o `deploy.sh` o roda na imagem nova, com o `.env` do ambiente, antes de trocar a cor. Se falhar, a troca não acontece.
+
+Uma stack nova é uma pasta em `examples/` com um `stack.conf` (detecção e padrões) e os arquivos a copiar. Veja o [`stack.conf` do Next.js](examples/nextjs/stack.conf).
 
 ### 2. Prepare a VM
 
@@ -222,7 +248,7 @@ Só existe uma versão anterior disponível: o deploy seguinte compila na cor li
 
 ## O que fica com cada sistema
 
-- **`Dockerfile`:** depende da tecnologia. A imagem precisa ter `wget`, `curl` ou `node` para o health check do compose. Há um pronto para [Next.js com Prisma](examples/nextjs-prisma).
+- **`Dockerfile`:** depende da tecnologia. A imagem precisa ter `wget`, `curl` ou `node` para o health check do compose. Há prontos para Next.js, Node.js e front-ends com Vite em [`examples/`](examples).
 - **Rota de saúde:** responde 200 só quando a aplicação e o banco estão prontos, e sem exigir login.
 - **Migrações compatíveis:** as duas versões usam o mesmo banco durante a troca. Para remover ou renomear uma coluna, primeiro faça a versão nova parar de usá-la e só remova no deploy seguinte.
 - **`.env.example`:** com todas as variáveis. O `setup-host.sh` cria o `.env` a partir dele.

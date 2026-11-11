@@ -28,4 +28,8 @@ Remova o estágio `migrate` e o `COPY prisma` do `Dockerfile`, e o `compose.migr
 
 ## Outra stack
 
-Crie uma pasta em `examples/` com os mesmos papéis: um `Dockerfile` cuja imagem tenha `wget`, `curl` ou `node` (usados pelo health check do compose), a rota de saúde e, se houver, o `compose.migrate.yml`.
+Veja as outras stacks em [`examples/`](..). Uma stack nova é uma pasta com:
+
+- `stack.conf`: como detectar (`DETECTA='arquivo:texto ...'`) e os padrões (`APP_PORT`, `HEALTH`, `BUILD_ARGS_PREFIXO`, `VOLUMES_PADRAO`...). Não é copiado para o sistema.
+- Um `Dockerfile` cuja imagem tenha `wget`, `curl` ou `node` (usados pelo health check do compose), com `WORKDIR /app`.
+- A rota de saúde e, se houver, o `compose.migrate.yml` (ou `PERGUNTAR_MIGRACAO=1`, para o `--migrate-cmd`).

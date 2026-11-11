@@ -1,0 +1,30 @@
+.git
+.next
+.swc
+.vscode
+.claude
+.agents
+node_modules
+logs
+# Dados locais (banco, backups); as pastas de upload o scaffold.sh acrescenta no fim
+volume
+volumes
+pgdata
+postgres-data
+backups
+*.dump
+coverage
+graphify-out
+*.tsbuildinfo
+*.md
+# Segredos entram só em tempo de execução, pelo env_file
+.env
+.env.*
+# Arquivos de deploy: mudar um deles não deve invalidar o cache da imagem
+Dockerfile
+compose.*.yml
+deploy.sh
+deploy.conf
+.github
+.gitlab-ci.yml
+nginx
