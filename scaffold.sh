@@ -4,8 +4,13 @@
 # Ajuda: bash scaffold.sh --help
 set -euo pipefail
 
+# Tudo entre { e } é lido antes de rodar. Pelo curl ... | bash, o bash lê o script pela entrada
+# padrão aos poucos, e um comando do meio que lesse a entrada comeria o resto do script.
+{
+
 VERSAO=2.0.0
-AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pela entrada padrão (curl ... | bash) não há BASH_SOURCE: vale a pasta atual, e os modelos são baixados
+AQUI="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 
 uso() {
   echo "scaffold.sh $VERSAO"
@@ -47,6 +52,11 @@ Ele lê o repositório (remoto, branches, package.json, CI existente) para suger
 com listas de escolha, e no fim mostra o comando equivalente:
 
   bash scaffold.sh
+
+Sem o repositório zero-downtime-deploy na máquina, pelo curl (baixa os modelos para uma pasta
+temporária, apagada no fim; ZDD_REF escolhe a versão, ex.: ZDD_REF=v2.0.0):
+
+  bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh)
 
 O script também lê o código: variáveis NEXT_PUBLIC_* viram argumentos de build, as usadas no
 código e ausentes do .env.example entram nele, o job de teste sai do package.json e, na stack
@@ -128,6 +138,21 @@ erro_entrada() { printf '    %s%s %s%s\n' "$VERMELHO" "$I_ERRO" "$1" "$RESET" >/
 escolhido() { printf '    %s%s%s %s%s%s\n' "$VERDE" "$I_OK" "$RESET" "$FRACO" "$1" "$RESET" >/dev/tty; }
 
 falha() { printf '%s%s Erro:%s %s\n' "$VERMELHO" "$I_ERRO" "$RESET" "$1" >&2; exit 1; }
+
+# Pelo curl, sem o repositório ao lado do script: baixa modelos/ e examples/ da mesma versão
+# (ZDD_REF: branch ou tag, padrão master) para uma pasta temporária, apagada no fim
+BAIXADO="" CHAMADA="bash scaffold.sh" PROJETO_PAI="$(dirname "$AQUI")"
+if [ ! -d "$AQUI/modelos" ]; then
+  BAIXADO="$(mktemp -d)" PROJETO_PAI=""
+  trap 'rm -rf "$BAIXADO"' EXIT
+  printf '  %s%s Baixando os modelos do zero-downtime-deploy (%s)...%s\n' "$FRACO" "$I_INFO" "${ZDD_REF:-master}" "$RESET" >&2
+  curl -fsSL "https://codeload.github.com/kauacolins/zero-downtime-deploy/tar.gz/${ZDD_REF:-master}" \
+    | tar -xz -C "$BAIXADO" --strip-components=1 \
+    || falha "não consegui baixar os modelos do GitHub (versão ${ZDD_REF:-master})"
+  [ -d "$BAIXADO/modelos" ] || falha "o pacote baixado não tem a pasta modelos/"
+  AQUI="$BAIXADO"
+  CHAMADA="bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/${ZDD_REF:-master}/scaffold.sh)"
+fi
 
 # Roda FUNÇÃO com um indicador de progresso; a saída vai para o arquivo SAIDA
 com_espera() {
@@ -269,7 +294,7 @@ escolher_branch() {
 # node_modules, e o próprio zero-downtime-deploy. Um caminho absoluto por linha, até 40.
 listar_repos() {
   local atual="$1" raiz raizes=()
-  for raiz in "$PWD" "$(dirname "$PWD")" "$(dirname "$AQUI")" "$HOME" ${atual:+"$(dirname "$atual")"}; do
+  for raiz in "$PWD" "$(dirname "$PWD")" ${PROJETO_PAI:+"$PROJETO_PAI"} "$HOME" ${atual:+"$(dirname "$atual")"}; do
     [ -d "$raiz" ] && raizes+=("$(cd "$raiz" && pwd)")
   done
   printf '%s\n' "${raizes[@]}" | sort -u | while IFS= read -r raiz; do
@@ -283,7 +308,7 @@ listar_repos() {
 NL=$'\n'
 Q="[\"'\`]"  # aspas de string em JS/TS
 FONTES="" CODIGO=""
-trap 'rm -f "$FONTES" "$CODIGO"' EXIT
+trap 'rm -f "$FONTES" "$CODIGO"; [ -z "$BAIXADO" ] || rm -rf "$BAIXADO"' EXIT
 
 # Arquivos de código, sem dependências, saída de build nem testes
 listar_fontes() {
@@ -550,7 +575,7 @@ if [ -f "$DESTINO/$ARQ_CI" ] && ! grep -q zero-downtime-deploy "$DESTINO/$ARQ_CI
 fi
 
 if [ "$INTERATIVO" = 1 ]; then
-  cmd="bash scaffold.sh --sistema $SISTEMA --dominio-prod $DOMINIO_PROD --dominio-hml $DOMINIO_HML"
+  cmd="$CHAMADA --sistema $SISTEMA --dominio-prod $DOMINIO_PROD --dominio-hml $DOMINIO_HML"
   cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH --ci $CI"
   if [ -n "$STACK" ]; then cmd+=" --stack $STACK"; fi
   if [ "$PORTA_APP" != 3000 ]; then cmd+=" --porta-app $PORTA_APP"; fi
@@ -910,3 +935,4 @@ if [ "$CI" = gitlab ]; then
   item "o runner da VM precisa da tag $TAG_RUNNER (ou troque tags: no .gitlab-ci.yml)"
 fi
 item "commit e push nas branches $PROD_BRANCH e $HML_BRANCH; depois, na VM: bash setup-host.sh"
+}

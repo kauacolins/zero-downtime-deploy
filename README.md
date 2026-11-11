@@ -38,7 +38,16 @@ O `deploy.sh` de cada sistema faz, nesta ordem:
 
 ### 1. Gere os arquivos de deploy no repositório do sistema
 
-Na sua máquina:
+Na sua máquina, dentro do repositório do sistema, sem precisar clonar este projeto:
+
+```bash
+cd ~/meusistema
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/scaffold.sh)
+```
+
+Ele baixa os modelos para uma pasta temporária, apagada no fim, e pergunta o que precisa. Para fixar uma versão, use `ZDD_REF=v2.0.0 bash <(curl ...)`. `curl ... | bash` também funciona, e as perguntas continuam vindo do terminal.
+
+Ou, com o projeto clonado e as opções na linha de comando:
 
 ```bash
 git clone https://github.com/kauacolins/zero-downtime-deploy.git
@@ -69,6 +78,10 @@ O `scaffold.sh` nunca sobrescreve um arquivo que já existe. Revise o que foi ge
 Entre na VM com o **usuário do deploy** (não root, com sudo):
 
 ```bash
+# Sem guardar o arquivo; com perguntas, basta isto:
+bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh)
+
+# Ou baixando o arquivo, com as opções na linha de comando:
 curl -fsSLO https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh
 
 # GitHub: o token permite cadastrar a deploy key e o runner sozinho.

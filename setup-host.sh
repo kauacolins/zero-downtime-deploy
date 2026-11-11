@@ -4,6 +4,10 @@
 # Documentação: README.md do repositório.
 set -euo pipefail
 
+# Tudo entre { e } é lido antes de rodar. Pelo curl ... | bash, o bash lê o script pela entrada
+# padrão aos poucos, e um comando do meio que lesse a entrada comeria o resto do script.
+{
+
 # ---------------------------------------------------------------------------
 # Parâmetros
 FORGE=github GIT_HOST=github.com FORGE_DEFINIDO=0
@@ -16,6 +20,11 @@ SEGREDOS_PERGUNTADO=0 RETOMADO=0 ESTADO_ATIVO=0
 ORIGENS=()
 
 VERSAO=2.0.0
+# Como chamar de novo: pelo arquivo, ou pelo curl quando veio de bash <(curl ...) ou curl ... | bash
+case "$0" in
+  *setup-host.sh) CHAMADA="bash $0" ;;
+  *) CHAMADA="bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/${ZDD_REF:-master}/setup-host.sh)" ;;
+esac
 
 # Texto embutido: funciona também quando o script vem direto do curl, sem arquivo
 uso() {
@@ -76,6 +85,10 @@ com listas de escolha para branches, bancos do PostgreSQL, segredos e valores do
 No fim mostra o comando equivalente, para repetir sem perguntas:
 
   bash setup-host.sh
+
+Sem baixar o arquivo (ZDD_REF escolhe a versão, ex.: ZDD_REF=v2.0.0); opções vão depois:
+
+  bash <(curl -fsSL https://raw.githubusercontent.com/kauacolins/zero-downtime-deploy/master/setup-host.sh)
 
 As respostas e onde a execução parou ficam em ~/.local/state/zero-downtime-deploy/ (sem o
 GH_TOKEN nem os valores do .env). Rodando de novo sem opções, o script oferece continuar com as
@@ -551,9 +564,9 @@ compilar_imagens() {
   esac
   log="$BASE/build-$amb.log"
   # sg aplica o grupo docker sem precisar sair da sessão
-  if sg docker -c "cd '$dir' && APP_PREFIX='$prefixo' docker compose -p '$projeto-$cor' -f 'compose.$cor.yml' build" >"$log" 2>&1 \
+  if sg docker -c "cd '$dir' && APP_PREFIX='$prefixo' docker compose -p '$projeto-$cor' -f 'compose.$cor.yml' build" </dev/null >"$log" 2>&1 \
     && { [ ! -f "$dir/compose.migrate.yml" ] \
-      || sg docker -c "cd '$dir' && docker compose -p '$projeto-migrate' -f compose.migrate.yml build" >>"$log" 2>&1; }; then
+      || sg docker -c "cd '$dir' && docker compose -p '$projeto-migrate' -f compose.migrate.yml build" </dev/null >>"$log" 2>&1; }; then
     rm -f "$log"
     return 0
   fi
@@ -799,7 +812,7 @@ if [ "$INTERATIVO" = 1 ]; then
   fi
 
   # Comando equivalente, para repetir sem perguntas (o GH_TOKEN nunca entra aqui)
-  cmd="bash setup-host.sh --sistema $SISTEMA"
+  cmd="$CHAMADA --sistema $SISTEMA"
   [ "$FORGE" = gitlab ] && cmd+=" --gitlab $GIT_HOST"
   for r in "${REPOS[@]}"; do cmd+=" --repo $r"; done
   cmd+=" --prod-branch $PROD_BRANCH --hml-branch $HML_BRANCH"
@@ -1375,7 +1388,7 @@ if [ "$DEPLOY" = 1 ]; then
       for amb in "$HML_NOME" "$PROD_NOME"; do
         for spec in "${REPOS[@]}"; do
           ler_repo "$spec"
-          if sg docker -c "cd '$RAIZ/$amb' && bash deploy.sh '$amb'"; then
+          if sg docker -c "cd '$RAIZ/$amb' && bash deploy.sh '$amb'" </dev/null; then
             ok "$SLUG: deploy de $amb concluído"
           else
             aviso "$SLUG: deploy de $amb falhou (veja a saída acima); os seguintes não foram executados"
@@ -1425,7 +1438,8 @@ if [ "${#NOTAS[@]}" -gt 0 ]; then
 fi
 [ "${DOCKER[0]}" = sudo ] && printf '    %s%s%s Saia e entre de novo na sessão para usar docker sem sudo.\n' "$CIANO" "$I_INFO" "$RESET"
 if [ "${#PENDENCIAS[@]}" -gt 0 ]; then
-  printf '    %s%s%s Resolvidas as pendências, rode bash setup-host.sh e escolha continuar: as respostas são reaproveitadas\n' "$CIANO" "$I_INFO" "$RESET"
+  printf '    %s%s%s Resolvidas as pendências, rode %s e escolha continuar: as respostas são reaproveitadas\n' "$CIANO" "$I_INFO" "$RESET" "$CHAMADA"
 fi
 printf '\n%s%s Concluído em %dmin%02ds%s\n' "$VERDE$NEGRITO" "$I_OK" $((SECONDS / 60)) $((SECONDS % 60)) "$RESET"
 exit 0
+}
